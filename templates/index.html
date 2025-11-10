@@ -1,0 +1,382 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="filters">
+    <div class="filter-group">
+        <label class="filter-label">Minera</label>
+        <select id="mineraSelect">
+            <option value="">Seleccione una minera</option>
+            {% for minera in mineras %}
+            <option value="{{ minera }}">{{ minera }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    
+    <div class="filter-group">
+        <label class="filter-label">Año</label>
+        <select id="añoSelect">
+            <option value="2023">2023</option>
+            <option value="2024">2024</option>
+            <option value="2025" selected>2025</option>
+        </select>
+    </div>
+    
+    <div class="filter-group">
+        <label class="filter-label">Mes</label>
+        <select id="mesSelect">
+            <option value="">Seleccione un mes</option>
+            <option value="1">Enero</option>
+            <option value="2">Febrero</option>
+            <option value="3">Marzo</option>
+            <option value="4">Abril</option>
+            <option value="5">Mayo</option>
+            <option value="6">Junio</option>
+            <option value="7">Julio</option>
+            <option value="8">Agosto</option>
+            <option value="9">Septiembre</option>
+            <option value="10" selected>Octubre</option>
+            <option value="11">Noviembre</option>
+            <option value="12">Diciembre</option>
+        </select>
+    </div>
+    
+    <div class="filter-group">
+        <label class="filter-label">Semana</label>
+        <select id="semanaSelect">
+            <option value="">Seleccione una semana</option>
+        </select>
+    </div>
+</div>
+
+<div class="chart-container">
+    <h2 class="chart-title">Entregados Totalmente por Día</h2>
+    <canvas id="barChart"></canvas>
+</div>
+
+<div class="compliance-matrix" id="matrixContainer">
+    <div class="loading">Seleccione Minera, Mes y Semana para ver los datos</div>
+</div>
+
+<div class="button-group" style="margin-top: 30px;">
+    <a href="/admin/mineras" class="btn btn-secondary">Gestionar Mineras</a>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let barChart = null;
+
+// Funciones para manejar loading
+function showLoading(message = 'Cargando datos...', details = '') {
+    const container = document.getElementById('matrixContainer');
+    container.innerHTML = `
+        <div class="loading-container">
+            <div class="spinner"></div>
+            <div class="loading-text">${message}</div>
+            ${details ? `<div class="loading-details">${details}</div>` : ''}
+        </div>
+    `;
+}
+
+function hideLoading() {
+    // El loading se oculta automáticamente cuando se actualiza el contenido
+}
+
+// Inicializar al cargar la página
+document.addEventListener('DOMContentLoaded', function() {
+    // Event listeners para los filtros
+    document.getElementById('mineraSelect').addEventListener('change', onMineraChange);
+    document.getElementById('añoSelect').addEventListener('change', onAñoChange);
+    document.getElementById('mesSelect').addEventListener('change', onMesChange);
+    document.getElementById('semanaSelect').addEventListener('change', loadDashboardData);
+    
+    // Cargar semanas del mes por defecto (Octubre del año actual)
+    loadSemanas(10, 2025);
+});
+
+function onMineraChange() {
+    loadDashboardData();
+}
+
+function onAñoChange() {
+    const mes = document.getElementById('mesSelect').value;
+    const año = document.getElementById('añoSelect').value;
+    if (mes && año) {
+        loadSemanas(parseInt(mes), parseInt(año));
+    }
+    loadDashboardData();
+}
+
+function onMesChange() {
+    const mes = document.getElementById('mesSelect').value;
+    const año = document.getElementById('añoSelect').value;
+    if (mes && año) {
+        loadSemanas(parseInt(mes), parseInt(año));
+    }
+    loadDashboardData();
+}
+
+async function loadSemanas(mes, año) {
+    try {
+        // Mostrar loading en el select de semanas
+        const semanaSelect = document.getElementById('semanaSelect');
+        semanaSelect.innerHTML = '<option value="">Cargando semanas...</option>';
+        semanaSelect.disabled = true;
+
+        const response = await fetch(`/api/semanas/${mes}?año=${año}`);
+        const data = await response.json();
+        
+        semanaSelect.innerHTML = '<option value="">Seleccione una semana</option>';
+        
+        data.semanas.forEach(semana => {
+            const option = document.createElement('option');
+            option.value = semana;
+            option.textContent = `Semana ${semana}`;
+            if (semana === 1) option.selected = true;
+            semanaSelect.appendChild(option);
+        });
+        
+        semanaSelect.disabled = false;
+        
+    } catch (error) {
+        console.error('Error cargando semanas:', error);
+        const semanaSelect = document.getElementById('semanaSelect');
+        semanaSelect.innerHTML = '<option value="">Error al cargar semanas</option>';
+        semanaSelect.disabled = false;
+    }
+}
+
+async function loadDashboardData() {
+    const minera = document.getElementById('mineraSelect').value;
+    const año = document.getElementById('añoSelect').value;
+    const mes = document.getElementById('mesSelect').value;
+    const semana = document.getElementById('semanaSelect').value;
+    
+    if (!minera || !año || !mes || !semana) {
+        document.getElementById('matrixContainer').innerHTML = 
+            '<div class="loading">Seleccione Minera, Año, Mes y Semana para ver los datos</div>';
+        return;
+    }
+    
+    // Mostrar loading con detalles específicos
+    showLoading(
+        'Consultando base de datos...', 
+        `Obteniendo datos de ${minera} para ${getMesNombre(mes)} ${año}, Semana ${semana}`
+    );
+    
+    try {
+        const response = await fetch(`/api/dashboard_data?minera=${encodeURIComponent(minera)}&año=${año}&mes=${mes}&semana=${semana}`);
+        
+        if (!response.ok) {
+            throw new Error(`Error ${response.status}: ${response.statusText}`);
+        }
+        
+        showLoading('Procesando datos...', 'Generando gráficos y matrices');
+        
+        const data = await response.json();
+        
+        if (data.error) {
+            throw new Error(data.error);
+        }
+        
+        // Actualizar gráfico
+        updateChart(data.grafico);
+        
+        // Actualizar matriz
+        updateMatrix(data.matriz, minera);
+        
+    } catch (error) {
+        console.error('Error cargando datos:', error);
+        document.getElementById('matrixContainer').innerHTML = `
+            <div class="loading-container">
+                <div style="color: #D90000; font-size: 24px; margin-bottom: 15px;">⚠️</div>
+                <div class="loading-text" style="color: #D90000;">Error al cargar los datos</div>
+                <div class="loading-details">${error.message}</div>
+                <div class="loading-details" style="margin-top: 15px;">
+                    Por favor, verifique su conexión e intente nuevamente
+                </div>
+            </div>
+        `;
+    }
+}
+
+// Función auxiliar para obtener el nombre del mes
+function getMesNombre(mes) {
+    const meses = [
+        '', 'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+        'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+    ];
+    return meses[parseInt(mes)] || 'Mes';
+}
+
+function updateChart(graficoData) {
+    const ctx = document.getElementById('barChart').getContext('2d');
+    
+    // Destruir gráfico anterior si existe
+    if (barChart) {
+        barChart.destroy();
+    }
+    
+    // Verificar si hay datos
+    if (!graficoData.datos || graficoData.datos.length === 0) {
+        // Crear gráfico vacío con mensaje
+        barChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: ['Sin datos'],
+                datasets: [{
+                    label: 'No hay datos disponibles',
+                    data: [0],
+                    backgroundColor: ['#f0f0f0'],
+                    borderColor: ['#d0d0d0'],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: true,
+                plugins: {
+                    legend: { display: false },
+                    title: { display: false }
+                },
+                scales: {
+                    y: { beginAtZero: true }
+                }
+            }
+        });
+        return;
+    }
+    
+    const labels = graficoData.datos.map(d => d.fecha);
+    const valores = graficoData.datos.map(d => d.cantidad);
+    const colores = graficoData.datos.map(d => d.cumple ? '#8BC34A' : '#D90000');
+    
+    barChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Viajes Entregados',
+                data: valores,
+                backgroundColor: colores,
+                borderColor: colores,
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {
+                    display: false
+                },
+                title: {
+                    display: false
+                },
+                annotation: {
+                    annotations: {
+                        lineMin: {
+                            type: 'line',
+                            yMin: graficoData.minimo,
+                            yMax: graficoData.minimo,
+                            borderColor: '#FFA500',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            label: {
+                                content: `Mínimo (${graficoData.minimo})`,
+                                enabled: true,
+                                position: 'end'
+                            }
+                        },
+                        lineMax: {
+                            type: 'line',
+                            yMin: graficoData.maximo,
+                            yMax: graficoData.maximo,
+                            borderColor: '#FFA500',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            label: {
+                                content: `Máximo (${graficoData.maximo})`,
+                                enabled: true,
+                                position: 'end'
+                            }
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    title: {
+                        display: true,
+                        text: 'Número de Entregas',
+                        font: {
+                            size: 14,
+                            weight: 'bold'
+                        }
+                    },
+                    ticks: {
+                        stepSize: 2
+                    }
+                },
+                x: {
+                    title: {
+                        display: true,
+                        text: 'Fecha',
+                        font: {
+                            size: 14,
+                            weight: 'bold'
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+function updateMatrix(matrizData, minera) {
+    const container = document.getElementById('matrixContainer');
+    
+    if (!matrizData.transportistas || matrizData.transportistas.length === 0) {
+        container.innerHTML = '<div class="loading">No hay datos disponibles para esta selección</div>';
+        return;
+    }
+    
+    let html = '<table class="matrix-table"><thead><tr>';
+    html += '<th>Transportista</th>';
+    
+    matrizData.fechas.forEach(fecha => {
+        html += `<th>${fecha}</th>`;
+    });
+    
+    html += '</tr></thead><tbody>';
+    
+    matrizData.transportistas.forEach(transportista => {
+        html += '<tr>';
+        html += `<td class="transportista-cell">${transportista}</td>`;
+        
+        matrizData.fechas.forEach(fecha => {
+            const celda = matrizData.datos[transportista][fecha];
+            const colorClass = celda.porcentaje >= 85 ? 'green' : 'red';
+            
+            html += `<td>
+                <div class="percentage-circle ${colorClass}" 
+                     onclick="goToDetail('${minera}', '${transportista}', '${celda.fecha_full}')"
+                     title="${celda.cumplidos} de ${celda.total} viajes">
+                    ${celda.porcentaje}%
+                </div>
+            </td>`;
+        });
+        
+        html += '</tr>';
+    });
+    
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+
+function goToDetail(minera, transportista, fecha) {
+    window.location.href = `/detalle?minera=${encodeURIComponent(minera)}&transportista=${encodeURIComponent(transportista)}&fecha=${fecha}`;
+}
+</script>
+{% endblock %}

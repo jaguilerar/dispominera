@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="button-group">
+    <a href="/" class="btn btn-secondary">← Volver al Dashboard</a>
+</div>
+
+<div class="info-header">
+    <div class="info-item">
+        <span class="info-label">Minera:</span>
+        <span class="info-value">{{ minera.nombre if minera else 'No seleccionada' }}</span>
+    </div>
+    <div class="info-item">
+        <span class="info-label">Transportista:</span>
+        <span class="info-value">{{ transportista.nombre if transportista else 'No seleccionado' }}</span>
+    </div>
+    <div class="info-item">
+        <span class="info-label">Fecha:</span>
+        <span class="info-value">{{ fecha if fecha else 'No seleccionada' }}</span>
+    </div>
+</div>
+
+<div class="filters">
+    <div class="filter-group">
+        <label class="filter-label">Minera</label>
+        <select id="mineraSelect" onchange="updateFilters()">
+            <option value="">Seleccione una minera</option>
+            {% for m in mineras %}
+            <option value="{{ m.id }}" {% if minera and m.id == minera.id %}selected{% endif %}>
+                {{ m.nombre }}
+            </option>
+            {% endfor %}
+        </select>
+    </div>
+    
+    <div class="filter-group">
+        <label class="filter-label">Transportista</label>
+        <select id="transportistaSelect" onchange="updateFilters()">
+            <option value="">Seleccione un transportista</option>
+            {% for t in transportistas %}
+            <option value="{{ t.id }}" {% if transportista and t.id == transportista.id %}selected{% endif %}>
+                {{ t.nombre }}
+            </option>
+            {% endfor %}
+        </select>
+    </div>
+    
+    <div class="filter-group">
+        <label class="filter-label">Fecha</label>
+        <input type="date" id="fechaInput" value="{{ fecha if fecha else '' }}" onchange="updateFilters()">
+    </div>
+</div>
+
+{% if registros %}
+<div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 25px;">
+    <h2 style="margin-bottom: 20px; color: #333;">Registros de Viajes ({{ registros|length }} viajes)</h2>
+    
+    <table class="detail-table">
+        <thead>
+            <tr>
+                <th>Camión</th>
+                <th>Fecha</th>
+                <th>Turno</th>
+                <th>¿Cumplió?</th>
+                <th>Documento de Transporte</th>
+                <th>RCO</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for registro in registros %}
+            <tr>
+                <td><strong>{{ registro.camion }}</strong></td>
+                <td>{{ registro.fecha.strftime('%d-%m-%Y') }}</td>
+                <td>{{ registro.turno }}</td>
+                <td>
+                    {% if registro.cumplio %}
+                    <span class="check-icon">✓</span>
+                    {% else %}
+                    <span class="cross-icon">✗</span>
+                    {% endif %}
+                </td>
+                <td>{{ registro.documento_transporte }}</td>
+                <td>
+                    {% if registro.rco %}
+                    <span class="check-icon">✓</span>
+                    {% else %}
+                    <span class="cross-icon">✗</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div style="margin-top: 20px; padding: 15px; background: #f8f8f8; border-radius: 8px;">
+    <h3 style="margin-bottom: 10px; font-size: 16px;">Resumen</h3>
+    <div style="display: flex; gap: 30px; flex-wrap: wrap;">
+        <div>
+            <strong>Total de viajes:</strong> {{ registros|length }}
+        </div>
+        <div>
+            <strong>Viajes cumplidos:</strong> 
+            {{ registros|selectattr('cumplio', 'equalto', true)|list|length }}
+        </div>
+        <div>
+            <strong>Viajes no cumplidos:</strong> 
+            {{ registros|selectattr('cumplio', 'equalto', false)|list|length }}
+        </div>
+        <div>
+            <strong>% Cumplimiento:</strong> 
+            {% set cumplidos = registros|selectattr('cumplio', 'equalto', true)|list|length %}
+            {% set porcentaje = (cumplidos / registros|length * 100)|round|int if registros|length > 0 else 0 %}
+            <span style="color: {% if porcentaje >= 85 %}#4CAF50{% else %}#F44336{% endif %}; font-weight: bold;">
+                {{ porcentaje }}%
+            </span>
+        </div>
+    </div>
+</div>
+
+{% else %}
+<div style="text-align: center; padding: 60px; background: #f8f8f8; border-radius: 8px;">
+    <p style="font-size: 18px; color: #666;">
+        No hay registros disponibles para la selección actual.
+        <br><br>
+        Por favor, seleccione Minera, Transportista y Fecha para ver los datos.
+    </p>
+</div>
+{% endif %}
+
+<div class="button-group" style="margin-top: 30px;">
+    <a href="/admin/mineras" class="btn btn-secondary">Gestionar Mineras</a>
+    <button class="btn btn-success" onclick="alert('Funcionalidad de carga de datos próximamente')">Cargar Datos (CSV/Excel)</button>
+    <button class="btn btn-primary" onclick="alert('Funcionalidad de agregar viaje próximamente')">Agregar Viaje Manual</button>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function updateFilters() {
+    const mineraId = document.getElementById('mineraSelect').value;
+    const transportistaId = document.getElementById('transportistaSelect').value;
+    const fecha = document.getElementById('fechaInput').value;
+    
+    if (mineraId && transportistaId && fecha) {
+        window.location.href = `/detalle?minera_id=${mineraId}&transportista_id=${transportistaId}&fecha=${fecha}`;
+    }
+}
+</script>
+{% endblock %}

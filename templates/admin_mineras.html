@@ -1,0 +1,200 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="button-group">
+    <a href="/" class="btn btn-secondary">← Volver al Dashboard</a>
+</div>
+
+<div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 25px; margin-bottom: 30px;">
+    <h2 style="margin-bottom: 20px; color: #333;">Gestión de Mineras</h2>
+    
+    <div style="margin-bottom: 30px;">
+        <h3 style="font-size: 18px; margin-bottom: 15px;">Mineras Registradas</h3>
+        <table class="detail-table">
+            <thead>
+                <tr>
+                    <th>Nombre</th>
+                    <th>Viajes Mínimos</th>
+                    <th>Viajes Máximos</th>
+                    <th>Transportistas Asociados</th>
+                    <th>Acciones</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for minera in mineras %}
+                <tr>
+                    <td><strong>{{ minera.nombre }}</strong></td>
+                    <td>{{ minera.viajes_minimos_esperados }}</td>
+                    <td>{{ minera.viajes_maximos_esperados }}</td>
+                    <td>
+                        {% if minera.transportistas %}
+                            {{ minera.transportistas|map(attribute='nombre')|join(', ') }}
+                        {% else %}
+                            <em style="color: #999;">Sin transportistas</em>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <button class="btn btn-primary" style="padding: 8px 16px; font-size: 12px;" 
+                                onclick="editMinera({{ minera.id }}, '{{ minera.nombre }}', {{ minera.viajes_minimos_esperados }}, {{ minera.viajes_maximos_esperados }})">
+                            Editar
+                        </button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    
+    <button class="btn btn-success" onclick="showAddMineraForm()">+ Agregar Nueva Minera</button>
+</div>
+
+<div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 25px;">
+    <h2 style="margin-bottom: 20px; color: #333;">Transportistas Registrados</h2>
+    
+    <div style="margin-bottom: 30px;">
+        <table class="detail-table">
+            <thead>
+                <tr>
+                    <th>Nombre</th>
+                    <th>Mineras Asociadas</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for transportista in transportistas %}
+                <tr>
+                    <td><strong>{{ transportista.nombre }}</strong></td>
+                    <td>
+                        {% if transportista.mineras %}
+                            {{ transportista.mineras|map(attribute='nombre')|join(', ') }}
+                        {% else %}
+                            <em style="color: #999;">Sin mineras asociadas</em>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    
+    <button class="btn btn-success" onclick="showAddTransportistaForm()">+ Agregar Nuevo Transportista</button>
+</div>
+
+<!-- Modal para agregar/editar minera -->
+<div id="mineraModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000;">
+    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border-radius: 8px; width: 90%; max-width: 500px;">
+        <h3 style="margin-bottom: 20px;" id="mineraModalTitle">Agregar Nueva Minera</h3>
+        
+        <form id="mineraForm" onsubmit="saveMineraForm(event)">
+            <input type="hidden" id="mineraId">
+            
+            <div style="margin-bottom: 15px;">
+                <label class="filter-label">Nombre de la Minera</label>
+                <input type="text" id="mineraNombre" required style="width: 100%;">
+            </div>
+            
+            <div style="margin-bottom: 15px;">
+                <label class="filter-label">Viajes Mínimos Esperados</label>
+                <input type="number" id="mineraMinimo" value="11" required style="width: 100%;">
+            </div>
+            
+            <div style="margin-bottom: 15px;">
+                <label class="filter-label">Viajes Máximos Esperados</label>
+                <input type="number" id="mineraMaximo" value="13" required style="width: 100%;">
+            </div>
+            
+            <div style="margin-bottom: 20px;">
+                <label class="filter-label">Transportistas Asociados</label>
+                <div id="transportistasCheckboxes" style="padding: 10px; background: #f8f8f8; border-radius: 4px;">
+                    {% for transportista in transportistas %}
+                    <div style="margin: 8px 0;">
+                        <label style="display: flex; align-items: center; cursor: pointer;">
+                            <input type="checkbox" name="transportistas" value="{{ transportista.id }}" style="width: auto; margin-right: 10px;">
+                            <span>{{ transportista.nombre }}</span>
+                        </label>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            
+            <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                <button type="button" class="btn btn-secondary" onclick="closeMineraModal()">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Guardar</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal para agregar transportista -->
+<div id="transportistaModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000;">
+    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border-radius: 8px; width: 90%; max-width: 500px;">
+        <h3 style="margin-bottom: 20px;">Agregar Nuevo Transportista</h3>
+        
+        <form id="transportistaForm" onsubmit="saveTransportistaForm(event)">
+            <div style="margin-bottom: 15px;">
+                <label class="filter-label">Nombre del Transportista</label>
+                <input type="text" id="transportistaNombre" required style="width: 100%;">
+            </div>
+            
+            <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                <button type="button" class="btn btn-secondary" onclick="closeTransportistaModal()">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Guardar</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function showAddMineraForm() {
+    document.getElementById('mineraModalTitle').textContent = 'Agregar Nueva Minera';
+    document.getElementById('mineraId').value = '';
+    document.getElementById('mineraNombre').value = '';
+    document.getElementById('mineraMinimo').value = '11';
+    document.getElementById('mineraMaximo').value = '13';
+    
+    // Desmarcar todos los checkboxes
+    document.querySelectorAll('input[name="transportistas"]').forEach(cb => cb.checked = false);
+    
+    document.getElementById('mineraModal').style.display = 'block';
+}
+
+function editMinera(id, nombre, minimo, maximo) {
+    document.getElementById('mineraModalTitle').textContent = 'Editar Minera';
+    document.getElementById('mineraId').value = id;
+    document.getElementById('mineraNombre').value = nombre;
+    document.getElementById('mineraMinimo').value = minimo;
+    document.getElementById('mineraMaximo').value = maximo;
+    
+    // TODO: Cargar transportistas asociados (requiere endpoint adicional)
+    
+    document.getElementById('mineraModal').style.display = 'block';
+}
+
+function closeMineraModal() {
+    document.getElementById('mineraModal').style.display = 'none';
+}
+
+function saveMineraForm(event) {
+    event.preventDefault();
+    alert('Funcionalidad de guardar minera próximamente (requiere endpoint POST/PUT)');
+    closeMineraModal();
+}
+
+function showAddTransportistaForm() {
+    document.getElementById('transportistaNombre').value = '';
+    document.getElementById('transportistaModal').style.display = 'block';
+}
+
+function closeTransportistaModal() {
+    document.getElementById('transportistaModal').style.display = 'none';
+}
+
+function saveTransportistaForm(event) {
+    event.preventDefault();
+    alert('Funcionalidad de guardar transportista próximamente (requiere endpoint POST)');
+    closeTransportistaModal();
+}
+</script>
+{% endblock %}

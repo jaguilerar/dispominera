@@ -1,0 +1,7 @@
+# .gitignore file
+
+/Ejemplo
+/.env
+/instance
+/__pycache__
+/athena_test.py
