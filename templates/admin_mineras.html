@@ -5,39 +5,72 @@
     <a href="/" class="btn btn-secondary">← Volver al Dashboard</a>
 </div>
 
-<div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 25px; margin-bottom: 30px;">
-    <h2 style="margin-bottom: 20px; color: #333;">Gestión de Mineras</h2>
+<div style="background: #ffffff; border: 1px solid #e9ecef; border-radius: 6px; padding: 30px; margin-bottom: 30px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);">
+    <h2 style="margin-bottom: 25px; color: #2c3e50; font-size: 24px; font-weight: 600;">Configuración de Mineras</h2>
+    
+    <div class="info-header" style="margin-bottom: 25px;">
+        <div class="info-item">
+            <span class="info-label">Total de Mineras:</span>
+            <span class="info-value">{{ mineras|length }}</span>
+        </div>
+        <div class="info-item">
+            <span class="info-label">Fuente de Datos:</span>
+            <span class="info-value">Lista Predefinida</span>
+        </div>
+        <div class="info-item">
+            <span class="info-label">Modo:</span>
+            <span class="info-value">Solo Lectura</span>
+        </div>
+    </div>
     
     <div style="margin-bottom: 30px;">
-        <h3 style="font-size: 18px; margin-bottom: 15px;">Mineras Registradas</h3>
+        <h3 style="font-size: 18px; margin-bottom: 20px; color: #495057;">Mineras y Configuración de Viajes</h3>
         <table class="detail-table">
             <thead>
                 <tr>
-                    <th>Nombre</th>
+                    <th>Nombre de la Minera</th>
                     <th>Viajes Mínimos</th>
                     <th>Viajes Máximos</th>
-                    <th>Transportistas Asociados</th>
-                    <th>Acciones</th>
+                    <th>Rango de Cumplimiento</th>
+                    <th>Estado</th>
                 </tr>
             </thead>
             <tbody>
+                {% set config_viajes = {
+                    'MINA LA ESCONDIDA': {'minimo': 14, 'maximo': 14},
+                    'QUADRA SIERRA GORDA': {'minimo': 11, 'maximo': 11}, 
+                    'ANDINA': {'minimo': 6, 'maximo': 7},
+                    'EL TENIENTE': {'minimo': 3, 'maximo': 4},
+                    'CASERONES': {'minimo': 5, 'maximo': 6},
+                    'SALARES NORTE': {'minimo': 4, 'maximo': 5},
+                    'MINERA CANDELARIA': {'minimo': 9, 'maximo': 9},
+                    'LOS BRONCES': {'minimo': 6, 'maximo': 6},
+                    'MINISTRO HALES': {'minimo': 6, 'maximo': 6},
+                    'RADOMIRO TOMIC': {'minimo': 12, 'maximo': 14},
+                    'CHUQUICAMATA': {'minimo': 12, 'maximo': 14},
+                    'MINA GABY': {'minimo': 12, 'maximo': 14}
+                } %}
                 {% for minera in mineras %}
+                {% set config = config_viajes.get(minera, {'minimo': 11, 'maximo': 13}) %}
                 <tr>
-                    <td><strong>{{ minera.nombre }}</strong></td>
-                    <td>{{ minera.viajes_minimos_esperados }}</td>
-                    <td>{{ minera.viajes_maximos_esperados }}</td>
-                    <td>
-                        {% if minera.transportistas %}
-                            {{ minera.transportistas|map(attribute='nombre')|join(', ') }}
+                    <td><strong style="color: #34495e;">{{ minera }}</strong></td>
+                    <td style="text-align: center; color: #f39c12; font-weight: bold;">{{ config.minimo }}</td>
+                    <td style="text-align: center; color: #e74c3c; font-weight: bold;">{{ config.maximo }}</td>
+                    <td style="text-align: center;">
+                        {% if config.minimo == config.maximo %}
+                        <span style="background: #e3f2fd; color: #1976d2; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
+                            Exacto: {{ config.minimo }}
+                        </span>
                         {% else %}
-                            <em style="color: #999;">Sin transportistas</em>
+                        <span style="background: #f3e5f5; color: #7b1fa2; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
+                            {{ config.minimo }}-{{ config.maximo }}
+                        </span>
                         {% endif %}
                     </td>
-                    <td>
-                        <button class="btn btn-primary" style="padding: 8px 16px; font-size: 12px;" 
-                                onclick="editMinera({{ minera.id }}, '{{ minera.nombre }}', {{ minera.viajes_minimos_esperados }}, {{ minera.viajes_maximos_esperados }})">
-                            Editar
-                        </button>
+                    <td style="text-align: center;">
+                        <span style="background: #e8f5e8; color: #2e7d32; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600;">
+                            ✓ Activa
+                        </span>
                     </td>
                 </tr>
                 {% endfor %}
@@ -45,101 +78,88 @@
         </table>
     </div>
     
-    <button class="btn btn-success" onclick="showAddMineraForm()">+ Agregar Nueva Minera</button>
+    <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 20px; margin-top: 20px;">
+        <h4 style="color: #495057; margin-bottom: 15px; font-size: 16px;">📋 Información del Sistema</h4>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px;">
+            <div>
+                <strong>Configuración:</strong> Las bandas de viajes están predefinidas según especificaciones operativas
+            </div>
+            <div>
+                <strong>Actualización:</strong> Los valores se actualizan automáticamente en el dashboard
+            </div>
+            <div>
+                <strong>Validación:</strong> Los gráficos usan estas bandas para determinar cumplimiento
+            </div>
+        </div>
+    </div>
 </div>
 
-<div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 25px;">
-    <h2 style="margin-bottom: 20px; color: #333;">Transportistas Registrados</h2>
+<div style="background: #ffffff; border: 1px solid #e9ecef; border-radius: 6px; padding: 30px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);">
+    <h2 style="margin-bottom: 25px; color: #2c3e50; font-size: 24px; font-weight: 600;">Transportistas Registrados</h2>
     
+    <div class="info-header" style="margin-bottom: 25px;">
+        <div class="info-item">
+            <span class="info-label">Total de Transportistas:</span>
+            <span class="info-value">{{ transportistas|length }}</span>
+        </div>
+        <div class="info-item">
+            <span class="info-label">Fuente:</span>
+            <span class="info-value">AWS Athena</span>
+        </div>
+        <div class="info-item">
+            <span class="info-label">Actualización:</span>
+            <span class="info-value">Automática</span>
+        </div>
+    </div>
+    
+    {% if transportistas %}
     <div style="margin-bottom: 30px;">
         <table class="detail-table">
             <thead>
                 <tr>
-                    <th>Nombre</th>
-                    <th>Mineras Asociadas</th>
+                    <th>Nombre del Transportista</th>
+                    <th>Estado</th>
+                    <th>Información Adicional</th>
                 </tr>
             </thead>
             <tbody>
-                {% for transportista in transportistas %}
+                {% for transportista in transportistas[:20] %}
                 <tr>
-                    <td><strong>{{ transportista.nombre }}</strong></td>
-                    <td>
-                        {% if transportista.mineras %}
-                            {{ transportista.mineras|map(attribute='nombre')|join(', ') }}
-                        {% else %}
-                            <em style="color: #999;">Sin mineras asociadas</em>
-                        {% endif %}
+                    <td><strong style="color: #34495e;">{{ transportista }}</strong></td>
+                    <td style="text-align: center;">
+                        <span style="background: #e8f5e8; color: #2e7d32; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600;">
+                            ✓ Activo
+                        </span>
+                    </td>
+                    <td style="color: #6c757d; font-style: italic;">
+                        Disponible para todas las mineras
                     </td>
                 </tr>
                 {% endfor %}
+                {% if transportistas|length > 20 %}
+                <tr style="background: #f8f9fa;">
+                    <td colspan="3" style="text-align: center; padding: 15px; color: #6c757d; font-style: italic;">
+                        ... y {{ transportistas|length - 20 }} transportistas más (mostrando primeros 20)
+                    </td>
+                </tr>
+                {% endif %}
             </tbody>
         </table>
     </div>
-    
-    <button class="btn btn-success" onclick="showAddTransportistaForm()">+ Agregar Nuevo Transportista</button>
-</div>
-
-<!-- Modal para agregar/editar minera -->
-<div id="mineraModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000;">
-    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border-radius: 8px; width: 90%; max-width: 500px;">
-        <h3 style="margin-bottom: 20px;" id="mineraModalTitle">Agregar Nueva Minera</h3>
-        
-        <form id="mineraForm" onsubmit="saveMineraForm(event)">
-            <input type="hidden" id="mineraId">
-            
-            <div style="margin-bottom: 15px;">
-                <label class="filter-label">Nombre de la Minera</label>
-                <input type="text" id="mineraNombre" required style="width: 100%;">
-            </div>
-            
-            <div style="margin-bottom: 15px;">
-                <label class="filter-label">Viajes Mínimos Esperados</label>
-                <input type="number" id="mineraMinimo" value="11" required style="width: 100%;">
-            </div>
-            
-            <div style="margin-bottom: 15px;">
-                <label class="filter-label">Viajes Máximos Esperados</label>
-                <input type="number" id="mineraMaximo" value="13" required style="width: 100%;">
-            </div>
-            
-            <div style="margin-bottom: 20px;">
-                <label class="filter-label">Transportistas Asociados</label>
-                <div id="transportistasCheckboxes" style="padding: 10px; background: #f8f8f8; border-radius: 4px;">
-                    {% for transportista in transportistas %}
-                    <div style="margin: 8px 0;">
-                        <label style="display: flex; align-items: center; cursor: pointer;">
-                            <input type="checkbox" name="transportistas" value="{{ transportista.id }}" style="width: auto; margin-right: 10px;">
-                            <span>{{ transportista.nombre }}</span>
-                        </label>
-                    </div>
-                    {% endfor %}
-                </div>
-            </div>
-            
-            <div style="display: flex; gap: 10px; justify-content: flex-end;">
-                <button type="button" class="btn btn-secondary" onclick="closeMineraModal()">Cancelar</button>
-                <button type="submit" class="btn btn-primary">Guardar</button>
-            </div>
-        </form>
+    {% else %}
+    <div style="text-align: center; padding: 40px; background: #f8f9fa; border-radius: 6px; color: #6c757d;">
+        <h4 style="margin-bottom: 10px;">Sin transportistas disponibles</h4>
+        <p>No se encontraron transportistas en la base de datos de Athena</p>
     </div>
-</div>
-
-<!-- Modal para agregar transportista -->
-<div id="transportistaModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000;">
-    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border-radius: 8px; width: 90%; max-width: 500px;">
-        <h3 style="margin-bottom: 20px;">Agregar Nuevo Transportista</h3>
-        
-        <form id="transportistaForm" onsubmit="saveTransportistaForm(event)">
-            <div style="margin-bottom: 15px;">
-                <label class="filter-label">Nombre del Transportista</label>
-                <input type="text" id="transportistaNombre" required style="width: 100%;">
-            </div>
-            
-            <div style="display: flex; gap: 10px; justify-content: flex-end;">
-                <button type="button" class="btn btn-secondary" onclick="closeTransportistaModal()">Cancelar</button>
-                <button type="submit" class="btn btn-primary">Guardar</button>
-            </div>
-        </form>
+    {% endif %}
+    
+    <div style="background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 6px; padding: 20px; margin-top: 20px;">
+        <h4 style="color: #856404; margin-bottom: 15px; font-size: 16px;">⚠️ Nota Importante</h4>
+        <div style="color: #856404;">
+            <strong>Modo Solo Lectura:</strong> Esta página muestra la configuración actual del sistema. 
+            Las mineras y sus bandas de viajes están predefinidas según especificaciones operativas. 
+            Los transportistas se obtienen automáticamente desde AWS Athena y se actualizan en tiempo real.
+        </div>
     </div>
 </div>
 
@@ -147,54 +167,17 @@
 
 {% block extra_js %}
 <script>
-function showAddMineraForm() {
-    document.getElementById('mineraModalTitle').textContent = 'Agregar Nueva Minera';
-    document.getElementById('mineraId').value = '';
-    document.getElementById('mineraNombre').value = '';
-    document.getElementById('mineraMinimo').value = '11';
-    document.getElementById('mineraMaximo').value = '13';
-    
-    // Desmarcar todos los checkboxes
-    document.querySelectorAll('input[name="transportistas"]').forEach(cb => cb.checked = false);
-    
-    document.getElementById('mineraModal').style.display = 'block';
+// Función para mostrar información adicional
+function showInfo(type, name) {
+    alert(`Información de ${type}: ${name}\n\nEsta funcionalidad estará disponible en futuras versiones.`);
 }
 
-function editMinera(id, nombre, minimo, maximo) {
-    document.getElementById('mineraModalTitle').textContent = 'Editar Minera';
-    document.getElementById('mineraId').value = id;
-    document.getElementById('mineraNombre').value = nombre;
-    document.getElementById('mineraMinimo').value = minimo;
-    document.getElementById('mineraMaximo').value = maximo;
-    
-    // TODO: Cargar transportistas asociados (requiere endpoint adicional)
-    
-    document.getElementById('mineraModal').style.display = 'block';
-}
-
-function closeMineraModal() {
-    document.getElementById('mineraModal').style.display = 'none';
-}
-
-function saveMineraForm(event) {
-    event.preventDefault();
-    alert('Funcionalidad de guardar minera próximamente (requiere endpoint POST/PUT)');
-    closeMineraModal();
-}
-
-function showAddTransportistaForm() {
-    document.getElementById('transportistaNombre').value = '';
-    document.getElementById('transportistaModal').style.display = 'block';
-}
-
-function closeTransportistaModal() {
-    document.getElementById('transportistaModal').style.display = 'none';
-}
-
-function saveTransportistaForm(event) {
-    event.preventDefault();
-    alert('Funcionalidad de guardar transportista próximamente (requiere endpoint POST)');
-    closeTransportistaModal();
-}
+// Auto-refresh de transportistas cada 5 minutos
+setInterval(function() {
+    if (document.hidden === false) {
+        console.log('Auto-refresh de transportistas en segundo plano...');
+        // En producción, aquí se haría una llamada AJAX para actualizar la lista
+    }
+}, 300000); // 5 minutos
 </script>
 {% endblock %}

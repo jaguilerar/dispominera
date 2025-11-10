@@ -105,6 +105,13 @@ def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
 
         # Limpiar transportista
         df['Transportista'] = df['carriername1'].fillna('SIN_INFORMACION')
+        
+        # Excluir registros con transportista 'SIN_INFORMACION'
+        df = df[df['Transportista'] != 'SIN_INFORMACION']
+        
+        # Verificar si quedaron datos después del filtro
+        if df.empty:
+            return None
 
         return df
 
@@ -156,32 +163,73 @@ def obtener_mineras_athena():
     return mineras_predefinidas
 
 
+def obtener_configuracion_viajes():
+    """Obtener configuración de bandas mínimas y máximas de viajes por minera"""
+    configuracion_viajes = {
+        'MINA LA ESCONDIDA': {'minimo': 14, 'maximo': 14},
+        'QUADRA SIERRA GORDA': {'minimo': 11, 'maximo': 11}, 
+        'ANDINA': {'minimo': 6, 'maximo': 7},
+        'EL TENIENTE': {'minimo': 3, 'maximo': 4},
+        'CASERONES': {'minimo': 5, 'maximo': 6},
+        'SALARES NORTE': {'minimo': 4, 'maximo': 5},
+        'MINERA CANDELARIA': {'minimo': 9, 'maximo': 9},
+        'LOS BRONCES': {'minimo': 6, 'maximo': 6},
+        'MINISTRO HALES': {'minimo': 6, 'maximo': 6},
+        'RADOMIRO TOMIC': {'minimo': 12, 'maximo': 14},
+        'CHUQUICAMATA': {'minimo': 12, 'maximo': 14},
+        'MINA GABY': {'minimo': 12, 'maximo': 14}
+    }
+    return configuracion_viajes
+
+
 def obtener_transportistas_athena(minera_nombre, fecha_inicio, fecha_fin):
     """Obtener transportistas únicos para una minera y rango de fechas"""
     df = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
     if df is None or df.empty:
         return []
-    return sorted(df['Transportista'].fillna('SIN_INFORMACION').unique().tolist())
+    # Ya filtrado en obtener_datos_desde_athena, pero por seguridad adicional
+    transportistas = sorted(df['Transportista'].unique().tolist())
+    return [t for t in transportistas if t != 'SIN_INFORMACION']
 
 
 def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max):
     df = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
     if df is None or df.empty:
-        return {'datos': [], 'minimo': viajes_min, 'maximo': viajes_max}
+        return {'datos': [], 'minimo': viajes_min, 'maximo': viajes_max, 'tipo': 'apilado', 'transportistas': []}
 
-    _, resumen_diario = procesar_datos_athena(df, viajes_min, viajes_max)
+    tabla_base, resumen_diario = procesar_datos_athena(df, viajes_min, viajes_max)
+
+    # Obtener transportistas únicos
+    transportistas_unicos = sorted(tabla_base['Transportista'].unique())
+    
+    # Crear estructura para gráfico apilado
+    fechas_ordenadas = sorted(tabla_base['Fecha'].unique())
+    
+    datos_apilados = []
+    for fecha in fechas_ordenadas:
+        fecha_str = fecha.strftime('%d-%m')
+        datos_fecha = {'fecha': fecha_str, 'total': 0}
+        
+        # Agregar datos por transportista para esta fecha
+        for transportista in transportistas_unicos:
+            datos_transportista = tabla_base[
+                (tabla_base['Fecha'] == fecha) & 
+                (tabla_base['Transportista'] == transportista)
+            ]
+            cantidad = int(datos_transportista['Entregado totalmente'].sum()) if not datos_transportista.empty else 0
+            datos_fecha[transportista] = cantidad
+            datos_fecha['total'] += cantidad
+        
+        # Verificar si cumple con el rango
+        datos_fecha['cumple'] = viajes_min <= datos_fecha['total'] <= viajes_max
+        datos_apilados.append(datos_fecha)
 
     grafico_data = {
-        'datos': [
-            {
-                'fecha': row['Fecha'].strftime('%d-%m'),
-                'cantidad': int(row['Entregado totalmente']),
-                'cumple': bool(row['En_rango'])
-            }
-            for _, row in resumen_diario.iterrows()
-        ],
+        'datos': datos_apilados,
         'minimo': viajes_min,
-        'maximo': viajes_max
+        'maximo': viajes_max,
+        'tipo': 'apilado',
+        'transportistas': transportistas_unicos
     }
 
     return grafico_data
@@ -231,7 +279,9 @@ def obtener_transportistas_global():
         df = sql_athena(query)
         if df.empty:
             return []
-        return sorted(df['transportista'].dropna().unique().tolist())
+        # Filtrar 'SIN_INFORMACION' de la lista
+        transportistas = sorted(df['transportista'].dropna().unique().tolist())
+        return [t for t in transportistas if t != 'SIN_INFORMACION']
     except Exception as e:
         print(f"Error obteniendo transportistas desde Athena: {e}")
         return []
@@ -300,8 +350,14 @@ def dashboard_data():
     mes = request.args.get('mes', type=int)
     semana = request.args.get('semana', type=int)
     año = request.args.get('año', type=int, default=datetime.now().year)
-    viajes_min = request.args.get('viajes_min', type=int, default=11)
-    viajes_max = request.args.get('viajes_max', type=int, default=13)
+    
+    # Obtener configuración específica para la minera
+    config_viajes = obtener_configuracion_viajes()
+    minera_config = config_viajes.get(minera_nombre, {'minimo': 11, 'maximo': 13})
+    
+    # Permitir override desde parámetros de la URL
+    viajes_min = request.args.get('viajes_min', type=int, default=minera_config['minimo'])
+    viajes_max = request.args.get('viajes_max', type=int, default=minera_config['maximo'])
 
     if not USE_ATHENA:
         return jsonify({'error': 'Athena no está disponible en este entorno'}), 503
@@ -375,18 +431,17 @@ def api_mineras():
     """Endpoints de mineras — Athena-only read API. POST no soportado."""
     if request.method == 'GET':
         mineras = obtener_mineras_athena()
-        # devolver lista simple con valores por defecto para min/max
+        config_viajes = obtener_configuracion_viajes()
+        
+        # Devolver lista con configuración específica de cada minera
         return jsonify([{
             'nombre': m,
-            'viajes_minimos': 11,
-            'viajes_maximos': 13
+            'viajes_minimos': config_viajes.get(m, {'minimo': 11})['minimo'],
+            'viajes_maximos': config_viajes.get(m, {'maximo': 13})['maximo']
         } for m in mineras])
 
     elif request.method == 'POST':
         return jsonify({'error': 'Creación de mineras no soportada en modo Athena-only'}), 405
-
-
-# Database initialization and local example data removed — Athena-only mode
 
 
 if __name__ == '__main__':

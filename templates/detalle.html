@@ -8,11 +8,11 @@
 <div class="info-header">
     <div class="info-item">
         <span class="info-label">Minera:</span>
-        <span class="info-value">{{ minera.nombre if minera else 'No seleccionada' }}</span>
+        <span class="info-value">{{ minera if minera else 'No seleccionada' }}</span>
     </div>
     <div class="info-item">
         <span class="info-label">Transportista:</span>
-        <span class="info-value">{{ transportista.nombre if transportista else 'No seleccionado' }}</span>
+        <span class="info-value">{{ transportista if transportista else 'No seleccionado' }}</span>
     </div>
     <div class="info-item">
         <span class="info-label">Fecha:</span>
@@ -26,8 +26,8 @@
         <select id="mineraSelect" onchange="updateFilters()">
             <option value="">Seleccione una minera</option>
             {% for m in mineras %}
-            <option value="{{ m.id }}" {% if minera and m.id == minera.id %}selected{% endif %}>
-                {{ m.nombre }}
+            <option value="{{ m }}" {% if minera and m == minera %}selected{% endif %}>
+                {{ m }}
             </option>
             {% endfor %}
         </select>
@@ -38,8 +38,8 @@
         <select id="transportistaSelect" onchange="updateFilters()">
             <option value="">Seleccione un transportista</option>
             {% for t in transportistas %}
-            <option value="{{ t.id }}" {% if transportista and t.id == transportista.id %}selected{% endif %}>
-                {{ t.nombre }}
+            <option value="{{ t }}" {% if transportista and t == transportista %}selected{% endif %}>
+                {{ t }}
             </option>
             {% endfor %}
         </select>
@@ -58,30 +58,26 @@
     <table class="detail-table">
         <thead>
             <tr>
+                <th>Pedido</th>
                 <th>Camión</th>
                 <th>Fecha</th>
-                <th>Turno</th>
-                <th>¿Cumplió?</th>
-                <th>Documento de Transporte</th>
-                <th>RCO</th>
+                <th>Estado</th>
+                <th>Transportista</th>
+                <th>Cliente</th>
+                <th>Entregado</th>
             </tr>
         </thead>
         <tbody>
             {% for registro in registros %}
             <tr>
-                <td><strong>{{ registro.camion }}</strong></td>
-                <td>{{ registro.fecha.strftime('%d-%m-%Y') }}</td>
-                <td>{{ registro.turno }}</td>
+                <td><strong>{{ registro.get('vbeln', 'N/A') }}</strong></td>
+                <td><strong style="color: #3498db;">{{ registro.get('vehiclereal', 'Sin información') }}</strong></td>
+                <td>{{ registro.get('vdatu', 'N/A') }}</td>
+                <td>{{ registro.get('descrstatu', 'N/A') }}</td>
+                <td>{{ registro.get('Transportista', 'N/A') }}</td>
+                <td>{{ registro.get('vtext', 'N/A') }}</td>
                 <td>
-                    {% if registro.cumplio %}
-                    <span class="check-icon">✓</span>
-                    {% else %}
-                    <span class="cross-icon">✗</span>
-                    {% endif %}
-                </td>
-                <td>{{ registro.documento_transporte }}</td>
-                <td>
-                    {% if registro.rco %}
+                    {% if registro.get('Entregado totalmente', 0) == 1 %}
                     <span class="check-icon">✓</span>
                     {% else %}
                     <span class="cross-icon">✗</span>
@@ -100,20 +96,22 @@
             <strong>Total de viajes:</strong> {{ registros|length }}
         </div>
         <div>
-            <strong>Viajes cumplidos:</strong> 
-            {{ registros|selectattr('cumplio', 'equalto', true)|list|length }}
+            <strong>Viajes entregados:</strong> 
+            {{ registros|selectattr('Entregado totalmente', 'equalto', 1)|list|length }}
         </div>
         <div>
-            <strong>Viajes no cumplidos:</strong> 
-            {{ registros|selectattr('cumplio', 'equalto', false)|list|length }}
+            <strong>Viajes pendientes:</strong> 
+            {{ registros|selectattr('Entregado totalmente', 'equalto', 0)|list|length }}
         </div>
         <div>
-            <strong>% Cumplimiento:</strong> 
-            {% set cumplidos = registros|selectattr('cumplio', 'equalto', true)|list|length %}
-            {% set porcentaje = (cumplidos / registros|length * 100)|round|int if registros|length > 0 else 0 %}
-            <span style="color: {% if porcentaje >= 85 %}#4CAF50{% else %}#F44336{% endif %}; font-weight: bold;">
-                {{ porcentaje }}%
-            </span>
+            <strong>% Entregas completadas:</strong> 
+            {% set entregados = registros|selectattr('Entregado totalmente', 'equalto', 1)|list|length %}
+            {% set porcentaje = (entregados / registros|length * 100)|round|int if registros|length > 0 else 0 %}
+            {% if porcentaje >= 85 %}
+            <span style="color: #28a745; font-weight: bold;">{{ porcentaje }}%</span>
+            {% else %}
+            <span style="color: #dc3545; font-weight: bold;">{{ porcentaje }}%</span>
+            {% endif %}
         </div>
     </div>
 </div>
@@ -139,12 +137,12 @@
 {% block extra_js %}
 <script>
 function updateFilters() {
-    const mineraId = document.getElementById('mineraSelect').value;
-    const transportistaId = document.getElementById('transportistaSelect').value;
+    const minera = document.getElementById('mineraSelect').value;
+    const transportista = document.getElementById('transportistaSelect').value;
     const fecha = document.getElementById('fechaInput').value;
     
-    if (mineraId && transportistaId && fecha) {
-        window.location.href = `/detalle?minera_id=${mineraId}&transportista_id=${transportistaId}&fecha=${fecha}`;
+    if (minera && transportista && fecha) {
+        window.location.href = `/detalle?minera=${encodeURIComponent(minera)}&transportista=${encodeURIComponent(transportista)}&fecha=${fecha}`;
     }
 }
 </script>

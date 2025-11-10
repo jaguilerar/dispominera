@@ -5,25 +5,44 @@ Aplicación web desarrollada en Flask para el monitoreo y análisis del cumplimi
 ## 📋 Características
 
 - **Dashboard Interactivo**: Visualización de entregas por día con gráficos dinámicos
-- **Integración con AWS Athena**: Conexión directa a la tabla `historial_turnos` en `dispomate_staging`
+- **Integración con AWS Athena**: Conexión directa a la base de datos `logistica_scr_staging.etlist`
 - **Matriz de Cumplimiento**: Seguimiento por transportista y fecha con indicadores visuales
 - **Vista de Detalle**: Registro detallado de viajes con información completa
-- **Modo Dual**: Funciona con datos de Athena o SQLite local
-- **Parametrización**: Configuración flexible de viajes mínimos/máximos por minera
+- **Selector de Período**: Filtros por Año, Mes y Semana para análisis temporal flexible
+- **Lista Predefinida de Mineras**: 12 mineras principales precargadas en el sistema
+- **Loading Screen Inteligente**: Feedback visual durante la carga de datos con spinner animado
+- **Manejo de Errores Elegante**: Pantallas de error informativas y contextual
+
+## 🏭 Mineras Soportadas
+
+La aplicación incluye las siguientes mineras predefinidas:
+
+- **MINA LA ESCONDIDA**
+- **QUADRA SIERRA GORDA**
+- **ANDINA**
+- **EL TENIENTE**
+- **CASERONES**
+- **SALARES NORTE**
+- **MINERA CANDELARIA**
+- **LOS BRONCES**
+- **MINISTRO HALES**
+- **RADOMIRO TOMIC**
+- **CHUQUICAMATA**
+- **MINA GABY**
 
 ## 🔄 Modos de Operación
 
-### Modo 1: SQLite Local (Por defecto)
-- Usa base de datos local con datos de ejemplo
-- No requiere credenciales de AWS
-- Ideal para desarrollo y pruebas
-- Se activa automáticamente si `USE_ATHENA=false`
+### Modo Athena (Principal)
+- Conecta a AWS Athena para datos reales
+- Accede a `logistica_scr_staging.etlist`
+- Requiere credenciales de AWS configuradas
+- Se activa con `USE_ATHENA=true` (por defecto)
 
-### Modo 2: AWS Athena (Producción)
-- Conecta a Athena para datos reales
-- Requiere credenciales de AWS
-- Accede a `dispomate_staging.historial_turnos`
-- Se activa con `USE_ATHENA=true`
+### Modo Local (Fallback)
+- Se activa automáticamente si Athena no está disponible
+- Muestra interfaz completa sin datos
+- Útil para desarrollo y pruebas de UI
+- No requiere credenciales de AWS
 
 ## 🚀 Instalación
 
@@ -68,24 +87,28 @@ cp .env.example .env
 
 ## 🎯 Uso
 
-### Modo SQLite (Por defecto)
+### Configuración Rápida
 
 ```bash
+# Instalar dependencias
+pip install -r requirements.txt
+
+# Ejecutar la aplicación
 python app.py
 ```
 
 La aplicación estará disponible en: `http://localhost:5000`
 
-### Modo Athena
+### Con Athena (Recomendado)
 
 1. **Configurar variables de entorno**:
 
-Editar `.env`:
+Crear archivo `.env`:
 ```bash
 USE_ATHENA=true
 AWS_ACCESS_KEY=tu_access_key
 AWS_SECRET_KEY=tu_secret_key
-S3_BUCKET=s3://copec-gobierno-athena-queries-prd/copec/jaguilera@copec.cl
+S3_BUCKET=s3://tu-bucket-athena-queries/
 AWS_REGION=us-east-1
 ```
 
@@ -94,28 +117,59 @@ AWS_REGION=us-east-1
 python app.py
 ```
 
-La app mostrará en consola si está usando Athena o SQLite.
+La app mostrará en consola si está usando Athena o modo local.
+
+## 📊 Interfaz de Usuario
+
+### 🎛️ Controles de Filtros
+
+La aplicación incluye filtros intuitivos:
+
+1. **Selector de Minera**: Dropdown con las 12 mineras predefinidas
+2. **Selector de Año**: Opciones 2023, 2024, 2025 (2025 por defecto)
+3. **Selector de Mes**: Enero a Diciembre (Octubre por defecto)
+4. **Selector de Semana**: Se actualiza automáticamente según el mes y año seleccionados
+
+### 📈 Dashboard Principal
+
+- **Gráfico de Barras**: Entregas totalmente por día con códigos de color
+  - 🟢 Verde: Cumple con objetivos (entre 11-13 viajes)
+  - 🔴 Rojo: No cumple objetivos
+- **Matriz de Cumplimiento**: Vista por transportista y fecha
+  - Círculos de porcentaje clickeables
+  - Navegación directa a vista de detalle
+
+### 🔄 Estados de Carga
+
+La aplicación incluye un sistema de loading inteligente:
+
+- **🎯 Spinner Animado**: Indicador visual durante consultas
+- **📝 Mensajes Contextuales**: 
+  - "Consultando base de datos..."
+  - "Procesando datos... Generando gráficos y matrices"
+- **⚠️ Manejo de Errores**: Pantallas informativas con detalles del error
+- **📊 Carga por Fases**: Feedback específico para cada operación
 
 ## 📊 Estructura de Datos
 
-### Athena: Tabla historial_turnos
+### Athena: Tabla `logistica_scr_staging.etlist`
 
 Campos utilizados:
-- `vbeln`: Número de orden
-- `name1kunag`: Cliente (Minera)
-- `carriername1`: Transportista
-- `vehtext`: Camión
-- `fechasalidaprog`: Fecha programada
-- `statproc`: Estado del proceso
-- `especial`: Marca si es licitado
+- `vdatu`: Fecha de la entrega
+- `vtext`: Cliente/Minera
+- `carriername1`: Nombre del transportista
+- `descrstatu`: Estado de la entrega ('Entregado totalmente', 'Recibí Conforme')
+- `vbeln`: Número de pedido
+- Otros campos adicionales para análisis detallado
 
-### SQLite: Base de datos local
+### Lógica de Procesamiento
 
-Tablas:
-- `minera`: Configuración de mineras
-- `transportista`: Catálogo de transportistas
-- `registro_viaje`: Registros de viajes
-- `asociacion_minera_transportista`: Relaciones
+1. **Filtrado**: Por minera, rango de fechas y estado de entrega
+2. **Agregación**: 
+   - Entregas por día y transportista
+   - Resumen diario total
+   - Cálculo de cumplimiento vs objetivos (11-13 viajes/día)
+3. **Validación**: Comparación contra umbrales configurables
 
 ## 🔧 Configuración
 
@@ -143,21 +197,60 @@ Cada minera configura:
 ### Páginas Principales
 
 1. **Dashboard (`/`)**
-   - Fuente de datos indicada en pantalla (Athena/SQLite)
-   - Filtros por Minera, Mes y Semana
-   - Gráfico de entregas totales por día
-   - Matriz de cumplimiento por transportista
+   - Lista predefinida de 12 mineras principales
+   - Filtros por Año (2023-2025), Mes y Semana
+   - Gráfico de entregas totales por día con códigos de color
+   - Matriz de cumplimiento por transportista con porcentajes clickeables
+   - Sistema de loading con spinner animado
 
 2. **Vista de Detalle (`/detalle`)**
    - Tabla completa de registros de viajes
    - Filtros por Minera, Transportista y Fecha
-   - Resumen de cumplimiento
+   - Navegación desde matriz de cumplimiento
+   - Resumen de entregas por registro
 
-3. **Administración (`/admin/mineras`)**
-   - Gestión de mineras
-   - Gestión de transportistas
-   - Configuración de asociaciones
+3. **API Endpoints**
+   - `/api/dashboard_data`: Datos principales con soporte para filtros de año
+   - `/api/semanas/<mes>`: Cálculo dinámico de semanas por mes y año
 
+¡Excelente idea! Voy a implementar un loading screen que se muestre mientras se cargan los datos. Agregaré un spinner visual y actualizaré los mensajes de estado.
+
+1. Primero agrego el CSS para el spinner en el head o en un archivo CSS. Voy a revisar la estructura del proyecto:
+Read base.html
+
+Perfecto, veo que ya hay estilos para .loading. Ahora voy a agregar CSS para el spinner y actualizar el JavaScript para mostrar estados de carga más elegantes.
+
+1. Primero agrego CSS para el spinner en base.html:
+base.html+36-0
+2. Ahora actualizo el JavaScript para mostrar el loading spinner. Primero creo una función para mostrar el loading:
+index.html+16-0
+3. Actualizo la función loadSemanas para mostrar loading:
+index.html+10-1
+4. Actualizo loadDashboardData para mostrar loading detallado:
+index.html+36-1
+5. Ahora agrego loading al gráfico también, actualizando updateChart:
+index.html+30-0
+¡Perfecto! 🎉 He implementado un sistema completo de loading con las siguientes características:
+Nuevas características del Loading Screen:
+🎨 Spinner animado: Un elegante spinner rojo que coincide con los colores de tu app
+📝 Mensajes contextuales: Diferentes mensajes según el estado de carga
+📊 Detalles específicos: Muestra qué minera y período se está consultando
+⚠️ Manejo de errores: Pantalla de error elegante con detalles específicos
+🔄 Estados múltiples: Loading para semanas y datos principales
+Estados de Loading implementados:
+Carga de semanas:
+Select deshabilitado temporalmente
+Mensaje "Cargando semanas..."
+Carga de datos principales:
+Fase 1: "Consultando base de datos..." + detalles de la consulta
+Fase 2: "Procesando datos..." + "Generando gráficos y matrices"
+Estado de error:
+Ícono de advertencia
+Mensaje de error claro
+Detalles técnicos del error
+Sugerencia de solución
+Mejoras visuales:
+🎯 Spinner: 50px, animación suave de 1 segundo, color 
 ## 🔐 Seguridad
 
 ### ⚠️ IMPORTANTE
@@ -225,29 +318,75 @@ AWS_ACCESS_KEY=tu_access_key
 AWS_SECRET_KEY=tu_secret_key
 ```
 
-### La app no usa Athena
+### La app no conecta a Athena
 
 **Verificar**:
 1. `USE_ATHENA=true` en `.env`
-2. PyAthena instalado
-3. Credenciales correctas
+2. PyAthena instalado: `pip install PyAthena`
+3. Credenciales AWS correctas
 4. Revisar logs en consola al iniciar
 
-### Query de Athena falla
+### Loading infinito o datos no cargan
 
 **Posibles causas**:
-1. Nombre de base de datos incorrecto
-2. Nombre de tabla incorrecto
-3. Permisos IAM insuficientes
-4. Formato de fechas en query
+1. Credenciales de AWS incorrectas o expiradas
+2. Permisos insuficientes en IAM
+3. Nombre incorrecto de base de datos o tabla
+4. Red/proxy corporativo bloqueando conexión AWS
+
+**Solución**:
+```bash
+# Verificar credenciales
+python -c "from pyathena import connect; print('OK')"
+
+# Verificar variables de entorno
+python -c "import os; print(f'Athena: {os.getenv(\"USE_ATHENA\")}')"
+```
+
+### Error en consultas de fechas
+
+**Verificar**:
+1. Formato de fechas en Athena (YYYY-MM-DD)
+2. Zona horaria correcta
+3. Datos disponibles para el período seleccionado
+
+### Interface loading pero sin datos
+
+**Causa común**: No hay datos en Athena para la combinación Minera/Fecha seleccionada.
+
+**Solución**: Verificar disponibilidad de datos en el período consultado.
 
 ## 📝 Próximas Funcionalidades
 
-- [ ] Cache de queries de Athena
-- [ ] Exportación de datos a Excel
-- [ ] Carga masiva de datos
-- [ ] Dashboard de KPIs adicionales
-- [ ] Alertas automáticas por incumplimiento
+- [ ] Cache de queries de Athena para mejor performance
+- [ ] Exportación de datos a Excel/PDF
+- [ ] Dashboard de KPIs adicionales y métricas avanzadas
+- [ ] Alertas automáticas por incumplimiento vía email
+- [ ] Filtros adicionales (por transportista, tipo de carga)
+- [ ] Histórico de tendencias por minera
+- [ ] Comparación entre períodos
+- [ ] API REST completa para integración externa
+
+## 🎨 Características Técnicas
+
+### Frontend
+- **Responsive Design**: Se adapta a móviles y tablets
+- **Charts.js**: Gráficos interactivos y animados
+- **Loading States**: Spinner animado con mensajes contextuales
+- **Error Handling**: Pantallas de error elegantes
+- **Color Coding**: Verde/Rojo para cumplimiento/incumplimiento
+
+### Backend
+- **Flask**: Micro-framework web de Python
+- **PyAthena**: Conexión nativa a AWS Athena
+- **Pandas**: Procesamiento eficiente de datos
+- **Error Resilience**: Manejo robusto de errores de conexión
+
+### Performance
+- **Queries Optimizadas**: Filtros eficientes en Athena
+- **Lazy Loading**: Carga de datos bajo demanda
+- **Cálculo Dinámico**: Semanas calculadas automáticamente
+- **Estado Persistente**: Mantiene selecciones durante navegación
 
 ## 📄 Archivos Importantes
 
@@ -269,11 +408,13 @@ dispominera_v2/
 Esta aplicación web está basada en el notebook `dispominera.ipynb` y mantiene la misma lógica:
 
 - ✅ Conexión a Athena con PyAthena
-- ✅ Query a `dispomate_staging.historial_turnos`
+- ✅ Query a `logistica_scr_staging.etlist`
 - ✅ Procesamiento de datos con Pandas
-- ✅ Cálculo de "Entregado totalmente"
-- ✅ Distinción licitados/no licitados
-- ✅ Umbrales configurables de viajes
+- ✅ Cálculo de "Entregado totalmente" desde `descrstatu`
+- ✅ Agregación por fecha y transportista
+- ✅ Umbrales configurables (11-13 viajes por día)
+- ✅ Matriz de cumplimiento visual
+- ✅ Integración con análisis temporal (año/mes/semana)
 
 ## 📞 Soporte
 

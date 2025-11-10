@@ -49,7 +49,7 @@
 </div>
 
 <div class="chart-container">
-    <h2 class="chart-title">Entregados Totalmente por Día</h2>
+    <h2 class="chart-title">Entregas Totalmente por Día y Transportista</h2>
     <canvas id="barChart"></canvas>
 </div>
 
@@ -247,65 +247,44 @@ function updateChart(graficoData) {
         return;
     }
     
+    // Generar colores para transportistas
+    const transportistas = graficoData.transportistas || [];
+    const colores = generateColors(transportistas.length);
+    
     const labels = graficoData.datos.map(d => d.fecha);
-    const valores = graficoData.datos.map(d => d.cantidad);
-    const colores = graficoData.datos.map(d => d.cumple ? '#8BC34A' : '#D90000');
+    
+    // Crear datasets para cada transportista
+    const datasets = transportistas.map((transportista, index) => ({
+        label: transportista,
+        data: graficoData.datos.map(d => d[transportista] || 0),
+        backgroundColor: colores[index],
+        borderColor: colores[index],
+        borderWidth: 1
+    }));
     
     barChart = new Chart(ctx, {
         type: 'bar',
         data: {
             labels: labels,
-            datasets: [{
-                label: 'Viajes Entregados',
-                data: valores,
-                backgroundColor: colores,
-                borderColor: colores,
-                borderWidth: 1
-            }]
+            datasets: datasets
         },
         options: {
             responsive: true,
             maintainAspectRatio: true,
-            plugins: {
-                legend: {
-                    display: false
-                },
-                title: {
-                    display: false
-                },
-                annotation: {
-                    annotations: {
-                        lineMin: {
-                            type: 'line',
-                            yMin: graficoData.minimo,
-                            yMax: graficoData.minimo,
-                            borderColor: '#FFA500',
-                            borderWidth: 2,
-                            borderDash: [5, 5],
-                            label: {
-                                content: `Mínimo (${graficoData.minimo})`,
-                                enabled: true,
-                                position: 'end'
-                            }
-                        },
-                        lineMax: {
-                            type: 'line',
-                            yMin: graficoData.maximo,
-                            yMax: graficoData.maximo,
-                            borderColor: '#FFA500',
-                            borderWidth: 2,
-                            borderDash: [5, 5],
-                            label: {
-                                content: `Máximo (${graficoData.maximo})`,
-                                enabled: true,
-                                position: 'end'
-                            }
+            scales: {
+                x: {
+                    stacked: true,
+                    title: {
+                        display: true,
+                        text: 'Fecha',
+                        font: {
+                            size: 14,
+                            weight: 'bold'
                         }
                     }
-                }
-            },
-            scales: {
+                },
                 y: {
+                    stacked: true,
                     beginAtZero: true,
                     title: {
                         display: true,
@@ -318,20 +297,97 @@ function updateChart(graficoData) {
                     ticks: {
                         stepSize: 2
                     }
-                },
-                x: {
-                    title: {
-                        display: true,
-                        text: 'Fecha',
+                }
+            },
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'right',
+                    labels: {
+                        boxWidth: 20,
+                        padding: 10,
                         font: {
-                            size: 14,
-                            weight: 'bold'
+                            size: 12
+                        }
+                    }
+                },
+                title: {
+                    display: false
+                },
+                annotation: {
+                    annotations: {
+                        lineMin: {
+                            type: 'line',
+                            yMin: graficoData.minimo,
+                            yMax: graficoData.minimo,
+                            borderColor: '#f39c12',
+                            borderWidth: 2,
+                            borderDash: [6, 3],
+                            label: {
+                                content: `Mínimo (${graficoData.minimo})`,
+                                enabled: true,
+                                position: 'end',
+                                backgroundColor: 'rgba(243, 156, 18, 0.9)',
+                                color: 'white',
+                                font: {
+                                    weight: 'bold',
+                                    size: 11
+                                }
+                            }
+                        },
+                        lineMax: {
+                            type: 'line',
+                            yMin: graficoData.maximo,
+                            yMax: graficoData.maximo,
+                            borderColor: '#e74c3c',
+                            borderWidth: 2,
+                            borderDash: [6, 3],
+                            label: {
+                                content: `Máximo (${graficoData.maximo})`,
+                                enabled: true,
+                                position: 'end',
+                                backgroundColor: 'rgba(231, 76, 60, 0.9)',
+                                color: 'white',
+                                font: {
+                                    weight: 'bold',
+                                    size: 11
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     });
+}
+
+// Función para generar colores distintivos para transportistas (paleta corporativa)
+function generateColors(count) {
+    const corporateColors = [
+        '#3498db', '#2980b9', '#34495e', '#2c3e50', '#95a5a6',
+        '#7f8c8d', '#e74c3c', '#c0392b', '#e67e22', '#d35400',
+        '#f39c12', '#f1c40f', '#27ae60', '#229954', '#16a085',
+        '#138d75', '#8e44ad', '#7d3c98', '#2980b9', '#5dade2',
+        '#48c9b0', '#52be80', '#f7dc6f', '#f8c471', '#ec7063',
+        '#af7ac5', '#85c1e9', '#7fb3d3', '#76d7c4', '#82e0aa',
+        '#f9e79f', '#f5b7b1', '#d7bde2', '#a9cce3', '#a2d9ce',
+        '#abebc6', '#fdeaa7', '#fadbd8', '#e8daef', '#d6eaf8',
+        '#d5f3e8', '#d6f3d6', '#fef5d3', '#fdedec', '#f4ecf7',
+        '#ebf3fd', '#e8f6f3', '#e8f8f5', '#fef9e7', '#fdf2e9'
+    ];
+    
+    if (count <= corporateColors.length) {
+        return corporateColors.slice(0, count);
+    }
+    
+    // Si necesitamos más colores, generamos algunos adicionales en tonos corporativos
+    const extraColors = [];
+    for (let i = corporateColors.length; i < count; i++) {
+        const hue = (i * 137.508) % 360;
+        extraColors.push(`hsl(${hue}, 45%, 55%)`); // Saturación y luminosidad corporativa
+    }
+    
+    return [...corporateColors, ...extraColors];
 }
 
 function updateMatrix(matrizData, minera) {
