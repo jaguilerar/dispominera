@@ -3,6 +3,9 @@ from datetime import datetime, timedelta
 import os
 import pandas as pd
 import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Intentar importar pyathena, pero permitir que la app funcione sin él
 try:
@@ -14,7 +17,7 @@ except ImportError:
     print("⚠️ pyathena no disponible. La app usará datos de ejemplo de SQLite.")
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'dev-secret-key-change-in-production'
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', '')
 
 # Configuración de AWS Athena (usar variables de entorno en producción)
 AWS_CONFIG = {
@@ -24,9 +27,9 @@ AWS_CONFIG = {
     'region_name': os.getenv('AWS_REGION', '')
 }
 
-# Nombre base de datos/tabla en Athena
-DATABASE_ATHENA = 'logistica_scr_staging'
-TABLA_PEDIDOS = 'etlist'
+# Nombre base de datos/tabla en Athena (desde variables de entorno)
+DATABASE_ATHENA = os.getenv('DATABASE_ATHENA', '')
+TABLA_PEDIDOS = os.getenv('TABLA_PEDIDOS', '')
 
 
 # Forzar por defecto el uso de Athena si la librería está disponible.
@@ -594,5 +597,12 @@ def api_mineras():
 
 
 if __name__ == '__main__':
-    # Athena-only mode: ensure USE_ATHENA is True in env or pyathena is installed.
-    app.run(debug=True, port=5000)
+    # Configuración para producción en Render
+    port = int(os.getenv('PORT', 5000))
+    debug = os.getenv('FLASK_ENV', 'development') == 'development'
+    
+    print(f"🚀 Iniciando aplicación en puerto {port}")
+    print(f"🔧 Debug mode: {debug}")
+    print(f"⚡ Athena disponible: {ATHENA_AVAILABLE}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)

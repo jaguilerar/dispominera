@@ -76,52 +76,6 @@
         </table>
     </div>
     
-    <div style="margin-top: 30px;">
-        <h3 style="font-size: 18px; margin-bottom: 20px; color: #495057;">👥 Configuración de Transportistas por Minera</h3>
-        <table class="detail-table">
-            <thead>
-                <tr>
-                    <th>Nombre de la Minera</th>
-                    <th>Transportistas Asignados</th>
-                    <th>Bandas Totales</th>
-                    <th>Bandas por Transportista</th>
-                    <th>Eficiencia</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% set config_transportistas = {
-                    'MINA LA ESCONDIDA': 3,
-                    'QUADRA SIERRA GORDA': 2,
-                    'ANDINA': 2,
-                    'EL TENIENTE': 2,
-                    'CASERONES': 2,
-                    'SALARES NORTE': 2,
-                    'MINERA CANDELARIA': 2,
-                    'LOS BRONCES': 3,
-                    'CODELCO': 8
-                } %}
-                {% for minera in mineras %}
-                {% set config = config_viajes.get(minera, {'minimo': 11, 'maximo': 13}) %}
-                {% set num_transportistas = config_transportistas.get(minera, 1) %}
-                {% set min_por_transportista = (config.minimo / num_transportistas) | round(1) %}
-                {% set max_por_transportista = (config.maximo / num_transportistas) | round(1) %}
-                <tr>
-                    <td><strong style="color: #34495e;">{{ minera }}</strong></td>
-                    <td style="text-align: center; color: #2980b9; font-weight: bold;">{{ num_transportistas }}</td>
-                    <td style="text-align: center; color: #7f8c8d;">{{ config.minimo }}-{{ config.maximo }}</td>
-                    <td style="text-align: center; color: #27ae60; font-weight: bold;">{{ min_por_transportista }}-{{ max_por_transportista }}</td>
-                    <td style="text-align: center;">
-                        {% set eficiencia = ((config.minimo + config.maximo) / 2 / num_transportistas) | round(1) %}
-                        <span style="background: #e8f5e8; color: #2e7d32; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
-                            {{ eficiencia }} viajes/transportista
-                        </span>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-    
     <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 20px; margin-top: 20px;">
         <h4 style="color: #495057; margin-bottom: 15px; font-size: 16px;">📋 Información del Sistema</h4>
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px;">
@@ -133,15 +87,6 @@
             </div>
             <div>
                 <strong>Validación:</strong> Los gráficos usan estas bandas para determinar cumplimiento
-            </div>
-            <div>
-                <strong>Distribución:</strong> Las bandas se dividen automáticamente entre transportistas asignados
-            </div>
-            <div>
-                <strong>Matriz:</strong> Cada transportista es evaluado contra su banda individual
-            </div>
-            <div>
-                <strong>Cumplimiento:</strong> Verde ≥85% de la banda individual, Rojo &lt;85%
             </div>
         </div>
     </div>
@@ -230,14 +175,6 @@
     </div>
     {% endif %}
     
-    <div style="background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 6px; padding: 20px; margin-top: 20px;">
-        <h4 style="color: #856404; margin-bottom: 15px; font-size: 16px;">⚠️ Nota Importante</h4>
-        <div style="color: #856404;">
-            <strong>Modo Solo Lectura:</strong> Esta página muestra la configuración actual del sistema. 
-            Las mineras y sus bandas de viajes están predefinidas según especificaciones operativas. 
-            Los transportistas se obtienen automáticamente desde AWS Athena y se actualizan en tiempo real.
-        </div>
-    </div>
 </div>
 
 {% endblock %}

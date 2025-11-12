@@ -2,7 +2,32 @@
 
 /Ejemplo
 /.env
+/.env.local
+/.env.production
 /instance
 /__pycache__
 /athena_test.py
 /test_codelco.py
+
+# Archivos de Python adicionales
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
