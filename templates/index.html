@@ -34,7 +34,7 @@
             <option value="7">Julio</option>
             <option value="8">Agosto</option>
             <option value="9">Septiembre</option>
-            <option value="10" selected>Octubre</option>
+            <option value="10">Octubre</option>
             <option value="11">Noviembre</option>
             <option value="12">Diciembre</option>
         </select>
@@ -84,14 +84,25 @@ function hideLoading() {
 
 // Inicializar al cargar la página
 document.addEventListener('DOMContentLoaded', function() {
+    // Establecer fecha actual
+    const hoy = new Date();
+    const mesActual = hoy.getMonth() + 1; // getMonth() retorna 0-11, necesitamos 1-12
+    const añoActual = hoy.getFullYear();
+    
+    // Establecer año actual
+    document.getElementById('añoSelect').value = añoActual;
+    
+    // Establecer mes actual
+    document.getElementById('mesSelect').value = mesActual;
+    
     // Event listeners para los filtros
     document.getElementById('mineraSelect').addEventListener('change', onMineraChange);
     document.getElementById('añoSelect').addEventListener('change', onAñoChange);
     document.getElementById('mesSelect').addEventListener('change', onMesChange);
     document.getElementById('semanaSelect').addEventListener('change', loadDashboardData);
     
-    // Cargar semanas del mes por defecto (Octubre del año actual)
-    loadSemanas(10, 2025);
+    // Cargar semanas del mes actual y establecer semana actual
+    loadSemanas(mesActual, añoActual, true); // El tercer parámetro indica que debe seleccionar la semana actual
 });
 
 function onMineraChange() {
@@ -102,7 +113,7 @@ function onAñoChange() {
     const mes = document.getElementById('mesSelect').value;
     const año = document.getElementById('añoSelect').value;
     if (mes && año) {
-        loadSemanas(parseInt(mes), parseInt(año));
+        loadSemanas(parseInt(mes), parseInt(año), false); // No seleccionar automáticamente al cambiar año
     }
     loadDashboardData();
 }
@@ -111,12 +122,12 @@ function onMesChange() {
     const mes = document.getElementById('mesSelect').value;
     const año = document.getElementById('añoSelect').value;
     if (mes && año) {
-        loadSemanas(parseInt(mes), parseInt(año));
+        loadSemanas(parseInt(mes), parseInt(año), false); // No seleccionar automáticamente al cambiar mes
     }
     loadDashboardData();
 }
 
-async function loadSemanas(mes, año) {
+async function loadSemanas(mes, año, seleccionarActual = false) {
     try {
         // Mostrar loading en el select de semanas
         const semanaSelect = document.getElementById('semanaSelect');
@@ -128,11 +139,31 @@ async function loadSemanas(mes, año) {
         
         semanaSelect.innerHTML = '<option value="">Seleccione una semana</option>';
         
+        let semanaActual = 1; // Por defecto la primera semana
+        
+        // Si se solicita seleccionar la semana actual, calcularla
+        if (seleccionarActual) {
+            const hoy = new Date();
+            const primerDiaDelMes = new Date(año, mes - 1, 1); // mes-1 porque Date usa 0-11
+            const diaActual = hoy.getDate();
+            
+            // Verificar si estamos en el mes actual
+            if (hoy.getMonth() + 1 === mes && hoy.getFullYear() === año) {
+                // Calcular en qué semana del mes estamos
+                semanaActual = Math.ceil(diaActual / 7);
+                
+                // Verificar que la semana calculada esté dentro del rango disponible
+                if (semanaActual > data.semanas.length) {
+                    semanaActual = data.semanas.length;
+                }
+            }
+        }
+        
         data.semanas.forEach(semana => {
             const option = document.createElement('option');
             option.value = semana;
             option.textContent = `Semana ${semana}`;
-            if (semana === 1) option.selected = true;
+            if (semana === semanaActual) option.selected = true;
             semanaSelect.appendChild(option);
         });
         

@@ -77,17 +77,32 @@ def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
     if not USE_ATHENA:
         return None
 
-    # Escapar comillas simples en el nombre de la minera
-    minera_safe = minera_nombre.replace("'", "''")
-
-    # Query adaptada de athena_test.py
-    query = f"""
-    SELECT *
-    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
-    WHERE vdatu >= '{fecha_inicio.strftime('%Y-%m-%d')}'
-      AND vdatu <= '{fecha_fin.strftime('%Y-%m-%d')}'
-      AND vtext LIKE '{minera_safe}'
-    """
+    # Manejar el caso especial de CODELCO
+    if minera_nombre == 'CODELCO':
+        mineras_codelco = obtener_mineras_codelco()
+        # Crear query para todas las mineras de CODELCO
+        conditions = []
+        for minera in mineras_codelco:
+            minera_safe = minera.replace("'", "''")
+            conditions.append(f"vtext LIKE '{minera_safe}'")
+        
+        query = f"""
+        SELECT *
+        FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
+        WHERE vdatu >= '{fecha_inicio.strftime('%Y-%m-%d')}'
+          AND vdatu <= '{fecha_fin.strftime('%Y-%m-%d')}'
+          AND ({' OR '.join(conditions)})
+        """
+    else:
+        # Caso normal para mineras individuales
+        minera_safe = minera_nombre.replace("'", "''")
+        query = f"""
+        SELECT *
+        FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
+        WHERE vdatu >= '{fecha_inicio.strftime('%Y-%m-%d')}'
+          AND vdatu <= '{fecha_fin.strftime('%Y-%m-%d')}'
+          AND vtext LIKE '{minera_safe}'
+        """
 
     try:
         df = sql_athena(query)
@@ -155,31 +170,111 @@ def obtener_mineras_athena():
         'SALARES NORTE',
         'MINERA CANDELARIA',
         'LOS BRONCES',
-        'MINISTRO HALES',
-        'RADOMIRO TOMIC',
-        'CHUQUICAMATA',
-        'MINA GABY'
+        'CODELCO'  # Agrupa: MINISTRO HALES, RADOMIRO TOMIC, CHUQUICAMATA, MINA GABY
     ]
     return mineras_predefinidas
+
+
+def obtener_mineras_codelco():
+    """Obtener lista de mineras que forman parte de CODELCO"""
+    return ['MINISTRO HALES', 'RADOMIRO TOMIC', 'CHUQUICAMATA', 'MINA GABY']
+
+
+def es_minera_codelco(minera_nombre):
+    """Verificar si una minera pertenece al grupo CODELCO"""
+    return minera_nombre in obtener_mineras_codelco()
 
 
 def obtener_configuracion_viajes():
     """Obtener configuración de bandas mínimas y máximas de viajes por minera"""
     configuracion_viajes = {
-        'MINA LA ESCONDIDA': {'minimo': 14, 'maximo': 14},
-        'QUADRA SIERRA GORDA': {'minimo': 11, 'maximo': 11}, 
+        'MINA LA ESCONDIDA': {'minimo': 38, 'maximo': 38},
+        'QUADRA SIERRA GORDA': {'minimo': 11, 'maximo': 13}, 
         'ANDINA': {'minimo': 6, 'maximo': 7},
         'EL TENIENTE': {'minimo': 3, 'maximo': 4},
         'CASERONES': {'minimo': 5, 'maximo': 6},
         'SALARES NORTE': {'minimo': 4, 'maximo': 5},
         'MINERA CANDELARIA': {'minimo': 9, 'maximo': 9},
-        'LOS BRONCES': {'minimo': 6, 'maximo': 6},
-        'MINISTRO HALES': {'minimo': 6, 'maximo': 6},
-        'RADOMIRO TOMIC': {'minimo': 12, 'maximo': 14},
-        'CHUQUICAMATA': {'minimo': 12, 'maximo': 14},
-        'MINA GABY': {'minimo': 12, 'maximo': 14}
+        'LOS BRONCES': {'minimo': 12, 'maximo': 12},
+        'CODELCO': {'minimo': 36, 'maximo': 42}  
     }
     return configuracion_viajes
+
+
+def obtener_configuracion_bandas_transportista():
+    """Obtener configuración de bandas de capacidad por transportista"""
+    # Banda estándar por transportista (viajes por día)
+    bandas_transportista = {
+        # Configuraciones específicas por transportista y minera
+        'SOC. DE TRANSP. ILZAUSPE LTDA.': {
+            'MINA LA ESCONDIDA': 13,
+            'QUADRA SIERRA GORDA': 11,
+            'ANDINA': 6,
+            'LOS BRONCES': 6
+        },
+        'TRANSPORTES DE COMBUSTIBLES CHILE L': {
+            'MINA LA ESCONDIDA': 14,
+            'SALARES NORTE': 4,
+            'MINERA CANDELARIA': 9
+        },
+        'TRANSPORTES SOLUCIONES LOGISTICAS': {
+            'MINA LA ESCONDIDA': 11,
+            'CODELCO': 11
+        },
+        'SCP SOTRASER S.A.': {
+            'CODELCO': 12
+        },
+        'TRANSPORTES VIGAL S.A.': {
+            'EL TENIENTE': 3,
+            'CASERONES': 5,
+            'CODELCO': 12
+        },
+        'SOCIEDAD DE TRANSPORTE NAZAR LTDA': {
+            'LOS BRONCES': 6
+        },
+        
+        # Bandas por defecto basadas en minera (para transportistas no especificados)
+        'default': {
+            'MINA LA ESCONDIDA': 5,     # viajes por día por transportista
+            'QUADRA SIERRA GORDA': 3,
+            'ANDINA': 2,
+            'EL TENIENTE': 1,
+            'CASERONES': 2,
+            'SALARES NORTE': 2,
+            'MINERA CANDELARIA': 3,
+            'LOS BRONCES': 3,
+            'CODELCO': 4
+        }
+    }
+    return bandas_transportista
+
+
+def calcular_banda_transportista(transportista, minera, bandas_config=None):
+    """Calcular la banda (capacidad diaria) de un transportista para una minera específica"""
+    if bandas_config is None:
+        bandas_config = obtener_configuracion_bandas_transportista()
+    
+    # Normalizar nombre del transportista para búsqueda
+    transportista_normalizado = transportista.upper().strip()
+    
+    # Buscar configuración específica del transportista (exacta)
+    if transportista_normalizado in bandas_config and minera in bandas_config[transportista_normalizado]:
+        return bandas_config[transportista_normalizado][minera]
+    
+    # Buscar por patrones parciales (para manejo de variaciones de nombres)
+    for nombre_config in bandas_config:
+        if nombre_config != 'default':
+            # Buscar si el nombre configurado está contenido en el nombre del transportista
+            if nombre_config.upper() in transportista_normalizado or transportista_normalizado in nombre_config.upper():
+                if minera in bandas_config[nombre_config]:
+                    return bandas_config[nombre_config][minera]
+    
+    # Usar banda por defecto de la minera
+    if minera in bandas_config['default']:
+        return bandas_config['default'][minera]
+    
+    # Banda por defecto general
+    return 3
 
 
 def obtener_transportistas_athena(minera_nombre, fecha_inicio, fecha_fin):
@@ -245,24 +340,40 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
     transportistas_unicos = tabla_base['Transportista'].unique()
     fechas = [d.strftime('%d-%m') for d in sorted(resumen_diario['Fecha'].unique())]
 
+    # Obtener configuración de bandas por transportista
+    bandas_config = obtener_configuracion_bandas_transportista()
+
     matriz_data = {
         'transportistas': list(transportistas_unicos),
         'fechas': fechas,
-        'datos': {}
+        'datos': {},
+        'bandas_transportistas': {}  # Para referencia en el frontend
     }
 
     for transportista_nombre in transportistas_unicos:
+        # Obtener banda específica del transportista para esta minera
+        banda_transportista = calcular_banda_transportista(transportista_nombre, minera_nombre, bandas_config)
+        matriz_data['bandas_transportistas'][transportista_nombre] = banda_transportista
+        
         matriz_data['datos'][transportista_nombre] = {}
         for _, row in resumen_diario.iterrows():
             fecha_str = row['Fecha'].strftime('%d-%m')
             datos_trans = tabla_base[(tabla_base['Transportista'] == transportista_nombre) & (tabla_base['Fecha'] == row['Fecha'])]
-            total = int(datos_trans['Entregado totalmente'].sum())
-            porcentaje = 100 if total > 0 else 0
+            viajes_realizados = int(datos_trans['Entregado totalmente'].sum())
+            
+            # Calcular disponibilidad: (viajes realizados / banda transportista) * 100
+            if banda_transportista > 0:
+                disponibilidad = (viajes_realizados / banda_transportista) * 100
+                # Limitar al 100% máximo para mejor visualización
+                disponibilidad = min(100, disponibilidad)
+            else:
+                disponibilidad = 0
 
             matriz_data['datos'][transportista_nombre][fecha_str] = {
-                'porcentaje': int(porcentaje),
-                'total': total,
-                'cumplidos': total,
+                'porcentaje': round(disponibilidad, 1),  # Disponibilidad como %
+                'total': viajes_realizados,             # Viajes realizados
+                'banda': banda_transportista,           # Capacidad del transportista
+                'cumplidos': viajes_realizados,         # Compatibilidad con frontend
                 'transportista_id': 0,
                 'fecha_full': row['Fecha'].strftime('%Y-%m-%d')
             }
@@ -417,13 +528,51 @@ def calcular_rango_semana(año, mes, semana):
 
 # Removed SQLite-based helpers. Use Athena helpers: obtener_datos_grafico_athena and obtener_datos_matriz_athena
 
-
 @app.route('/admin/mineras')
 def admin_mineras():
     """Gestión de mineras y asociaciones"""
     mineras = obtener_mineras_athena()
     transportistas = obtener_transportistas_global() if USE_ATHENA else []
     return render_template('admin_mineras.html', mineras=mineras, transportistas=transportistas)
+
+
+@app.route('/api/debug/transportistas')
+def debug_transportistas():
+    """Ruta temporal para identificar nombres exactos de transportistas"""
+    if not USE_ATHENA:
+        return jsonify({'error': 'Athena no está disponible'}), 503
+    
+    query = f"""
+    SELECT DISTINCT carriername1 as transportista, COUNT(*) as total_registros
+    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
+    WHERE carriername1 IS NOT NULL 
+    AND carriername1 != 'SIN_INFORMACION'
+    GROUP BY carriername1
+    ORDER BY total_registros DESC, transportista
+    LIMIT 50
+    """
+    
+    try:
+        df = sql_athena(query)
+        if df.empty:
+            return jsonify({'transportistas': [], 'mensaje': 'No se encontraron transportistas'})
+        
+        # Convertir a lista de diccionarios
+        transportistas_info = []
+        for _, row in df.iterrows():
+            transportistas_info.append({
+                'nombre': row['transportista'],
+                'registros': int(row['total_registros'])
+            })
+        
+        return jsonify({
+            'transportistas': transportistas_info,
+            'total_encontrados': len(transportistas_info),
+            'mensaje': 'Transportistas ordenados por cantidad de registros'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': f'Error obteniendo transportistas: {str(e)}'}), 500
 
 
 @app.route('/api/mineras', methods=['GET', 'POST'])
