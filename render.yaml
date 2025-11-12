@@ -1,12 +1,11 @@
 services:
   - type: web
     name: dispominera
-    runtime: python3
+    env: python
+    pythonVersion: 3.12.3 
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
       - key: USE_ATHENA
         value: true
       - key: FLASK_ENV
