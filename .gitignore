@@ -8,6 +8,7 @@
 /__pycache__
 /athena_test.py
 /test_codelco.py
+/dispominera.ipynb
 
 # Archivos de Python adicionales
 *.py[cod]

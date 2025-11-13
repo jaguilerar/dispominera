@@ -31,6 +31,11 @@ AWS_CONFIG = {
 DATABASE_ATHENA = os.getenv('DATABASE_ATHENA', '')
 TABLA_PEDIDOS = os.getenv('TABLA_PEDIDOS', '')
 
+# Configuración adicional para el análisis completo
+DATABASE_DISPOMATE = os.getenv('DATABASE_DISPOMATE', '')
+TABLA_TURNOS = os.getenv('TABLA_TURNOS', '')
+TABLA_RCO = os.getenv('TABLA_RCO', '')
+
 
 # Forzar por defecto el uso de Athena si la librería está disponible.
 # Si pyathena no está instalado, USE_ATHENA será False y la app informará al usuario.
@@ -70,6 +75,217 @@ def sql_athena(query):
 
 
 # NOTE: Removing SQLAlchemy models — the app now works exclusively with Athena.
+
+
+def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
+    """
+    Obtener datos completos integrando SCR, Turnos y RCO (similar al notebook)
+    """
+    if not USE_ATHENA:
+        return None
+
+    # 1. Obtener datos SCR (pedidos)
+    df_scr = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
+    if df_scr is None or df_scr.empty:
+        return None
+
+    # 2. Obtener turnos enviados
+    query_turnos = f"""
+    SELECT * 
+    FROM {DATABASE_DISPOMATE}.{TABLA_TURNOS}
+    WHERE DATE(fecha_inicio_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
+      AND DATE(fecha_inicio_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
+    ORDER BY fecha_inicio_utc
+    """
+    
+    try:
+        df_turnos = sql_athena(query_turnos)
+    except Exception as e:
+        print(f"Error obteniendo turnos: {e}")
+        df_turnos = pd.DataFrame()
+
+    # 3. Obtener conexiones RCO
+    query_rco = f"""
+    SELECT * 
+    FROM {DATABASE_DISPOMATE}.{TABLA_RCO}
+    WHERE DATE(fecha_conexion_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
+      AND DATE(fecha_conexion_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
+    ORDER BY fecha_conexion_utc
+    """
+    
+    try:
+        df_rco = sql_athena(query_rco)
+    except Exception as e:
+        print(f"Error obteniendo RCO: {e}")
+        df_rco = pd.DataFrame()
+
+    # 4. Procesar y combinar datos como en el notebook
+    resultado_completo = procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin)
+    
+    return resultado_completo
+
+
+def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin):
+    """
+    Procesar y combinar datos de SCR, Turnos y RCO (replicando lógica del notebook)
+    """
+    # Obtener vehículos únicos del SCR
+    vehiculos_totales = df_scr['vehiclereal'].dropna().unique()
+    vehiculos_totales = np.sort(vehiculos_totales.astype(int))
+    
+    # Lista de vehículos licitados (basada en el notebook)
+    vehiculos_licitados = [4002, 4003, 4049, 8054, 8120, 8348, 8820]
+    
+    # Crear tabla base combinando todos los vehículos con todas las fechas
+    fechas_rango = pd.date_range(start=fecha_inicio, end=fecha_fin, freq='D')
+    
+    base_data = []
+    for vehiculo in vehiculos_totales:
+        for fecha in fechas_rango:
+            base_data.append({
+                'Camion': int(vehiculo),
+                'Fecha': fecha.strftime('%d-%b'),
+                'fecha_completa': fecha,
+                'fecha_para_merge': fecha.date()
+            })
+    
+    tabla_base = pd.DataFrame(base_data)
+    tabla_base['¿Es licitado?'] = np.where(tabla_base['Camion'].isin(vehiculos_licitados), 'Si', 'No')
+    
+    # Procesar turnos enviados
+    if not df_turnos.empty:
+        # Obtener estado final por turno
+        estado_final = (
+            df_turnos.sort_values(['id_turno_uuid', 'fecha_hora'])
+                     .groupby('id_turno_uuid')
+                     .tail(1)[['id_turno_uuid', 'estado', 'id_vehiculo', 'fecha_inicio_utc']]
+        )
+        
+        enviados = estado_final[
+            (estado_final['estado'] == 'ENVIADO') &
+            (estado_final['id_vehiculo'].isin(vehiculos_totales))
+        ].copy()
+        
+        enviados['fecha'] = pd.to_datetime(enviados['fecha_inicio_utc']).dt.date
+        conteo_turnos = enviados.groupby(['id_vehiculo', 'fecha']).size().reset_index(name='Turnos_enviados')
+        
+        # Merge con tabla base
+        tabla_base = tabla_base.merge(
+            conteo_turnos,
+            left_on=['Camion', 'fecha_para_merge'],
+            right_on=['id_vehiculo', 'fecha'],
+            how='left'
+        )
+        tabla_base['Turnos_enviados'] = tabla_base['Turnos_enviados'].fillna(0).astype(int)
+        tabla_base = tabla_base.drop(columns=['fecha', 'id_vehiculo'], errors='ignore')
+    else:
+        tabla_base['Turnos_enviados'] = 0
+    
+    # Procesar conexiones RCO
+    if not df_rco.empty:
+        # Filtrar solo vehículos que están en vehiculos_totales y crear copia explícita
+        df_rco_filtrado = df_rco[df_rco['codigo_tanque'].isin(vehiculos_totales)].copy()
+        df_rco_filtrado['fecha_rco'] = pd.to_datetime(df_rco_filtrado['fecha_carga_particion']).dt.date
+        
+        conteos_rco = (df_rco_filtrado
+                      .groupby(['codigo_tanque', 'fecha_rco'])
+                      .size()
+                      .reset_index(name='Conexion_RCO'))
+        
+        # Merge con tabla base
+        tabla_base = tabla_base.merge(
+            conteos_rco,
+            left_on=['Camion', 'fecha_para_merge'],
+            right_on=['codigo_tanque', 'fecha_rco'],
+            how='left'
+        )
+        tabla_base['Conexion_RCO'] = tabla_base['Conexion_RCO'].fillna(0).astype(int)
+        tabla_base = tabla_base.drop(columns=['fecha_rco', 'codigo_tanque'], errors='ignore')
+    else:
+        tabla_base['Conexion_RCO'] = 0
+    
+    # Procesar datos SCR para estados
+    df_scr['fecha_corregida'] = pd.to_datetime(df_scr['vdatu']).dt.strftime('%Y-%m-%d')
+    
+    # Crear conteos por vehículo, fecha y estado
+    conteos_scr = (df_scr
+                   .groupby(['vehiclereal', 'fecha_corregida', 'descrstatu'])
+                   .size()
+                   .reset_index(name='cantidad'))
+    
+    # Crear tabla pivot para tener estados como columnas
+    pivot_scr = conteos_scr.pivot_table(
+        index=['vehiclereal', 'fecha_corregida'], 
+        columns='descrstatu', 
+        values='cantidad', 
+        fill_value=0
+    ).reset_index()
+    
+    # Limpiar nombres de columnas y asegurar que existan todas las columnas necesarias
+    pivot_scr.columns.name = None
+    estados_esperados = ['En Ruta', 'Entregado totalmente', 'Planificado']
+    for estado in estados_esperados:
+        if estado not in pivot_scr.columns:
+            pivot_scr[estado] = 0
+    
+    pivot_scr['vehiclereal'] = pivot_scr['vehiclereal'].astype(int)
+    
+    # Obtener transportista por vehículo y fecha
+    carriers = (
+        df_scr[['vehiclereal', 'fecha_corregida', 'carriername1']]
+        .dropna(subset=['carriername1'])
+        .drop_duplicates(subset=['vehiclereal', 'fecha_corregida'])
+        .groupby(['vehiclereal', 'fecha_corregida'], as_index=False).first()
+    )
+    carriers['vehiclereal'] = carriers['vehiclereal'].astype(int)
+    
+    # Crear fecha para merge
+    tabla_base['fecha_merge_scr'] = pd.to_datetime(tabla_base['Fecha'] + '-2025', format='%d-%b-%Y').dt.strftime('%Y-%m-%d')
+    
+    # Merge con datos SCR
+    tabla_final = tabla_base.merge(
+        pivot_scr,
+        left_on=['Camion', 'fecha_merge_scr'],
+        right_on=['vehiclereal', 'fecha_corregida'],
+        how='left'
+    )
+    
+    # Rellenar NaN con 0 para los estados
+    for estado in estados_esperados:
+        if estado in tabla_final.columns:
+            tabla_final[estado] = tabla_final[estado].fillna(0).astype(int)
+    
+    # Merge con transportistas
+    tabla_final = tabla_final.merge(
+        carriers,
+        left_on=['Camion', 'fecha_merge_scr'],
+        right_on=['vehiclereal', 'fecha_corregida'],
+        how='left'
+    )
+    
+    # Procesar transportista
+    tabla_final['Transportista'] = tabla_final.get('carriername1', pd.Series([None]*len(tabla_final)))
+    tabla_final['Transportista'] = tabla_final['Transportista'].replace('', pd.NA)
+    
+    # Llenar transportista faltante con el más común por vehículo
+    per_truck = carriers.groupby('vehiclereal', as_index=False)['carriername1'].first().set_index('vehiclereal')['carriername1'].to_dict()
+    tabla_final['Transportista'] = tabla_final['Transportista'].fillna(tabla_final['Camion'].map(per_truck))
+    tabla_final['Transportista'] = tabla_final['Transportista'].fillna('SIN_INFORMACION').astype(str)
+    
+    # Limpiar columnas auxiliares
+    tabla_final = tabla_final.drop(['fecha_merge_scr', 'vehiclereal', 'fecha_corregida', 'carriername1', 'fecha_para_merge'], axis=1, errors='ignore')
+    
+    # Renombrar columnas para mayor claridad
+    tabla_final = tabla_final.rename(columns={
+        'En Ruta': 'En_ruta',
+        'Entregado totalmente': 'Entregado_totalmente',
+        'Turnos_enviados': 'Turnos_enviados'
+    })
+    
+    # Filtrar transportistas sin información
+    tabla_final = tabla_final[tabla_final['Transportista'] != 'SIN_INFORMACION']
+    
+    return tabla_final
 
 
 # Funciones para obtener datos desde Athena
@@ -424,16 +640,43 @@ def detalle():
     fecha = request.args.get('fecha')
 
     registros = []
+    banda_info = {}
+    datos_completos = None
+    
     if USE_ATHENA and minera_nombre and fecha:
         fecha_obj = datetime.strptime(fecha, '%Y-%m-%d').date()
-        # obtener datos desde Athena y filtrar
-        df = obtener_datos_desde_athena(minera_nombre, fecha_obj, fecha_obj)
-        if df is not None and not df.empty:
+        
+        # Obtener datos completos (SCR + Turnos + RCO)
+        datos_completos = obtener_datos_completos_athena(minera_nombre, fecha_obj, fecha_obj)
+        
+        if datos_completos is not None and not datos_completos.empty:
             if transportista_nombre:
-                df = df[df['Transportista'] == transportista_nombre]
-
-            # Mapear filas a objetos simples para la plantilla
-            registros = df.to_dict('records')
+                datos_completos = datos_completos[datos_completos['Transportista'] == transportista_nombre]
+            
+            # Para mantener compatibilidad con el template existente, 
+            # también obtenemos los datos SCR básicos para los registros individuales
+            df_scr = obtener_datos_desde_athena(minera_nombre, fecha_obj, fecha_obj)
+            if df_scr is not None and not df_scr.empty:
+                if transportista_nombre:
+                    df_scr = df_scr[df_scr['Transportista'] == transportista_nombre]
+                registros = df_scr.to_dict('records')
+            
+            # Calcular bandas por transportista usando los datos completos
+            if not datos_completos.empty:
+                transportistas_unicos = datos_completos['Transportista'].unique()
+                banda_total = 0
+                bandas_por_transportista = {}
+                
+                for transp in transportistas_unicos:
+                    banda = calcular_banda_transportista(transp, minera_nombre)
+                    bandas_por_transportista[transp] = banda
+                    banda_total += banda
+                
+                banda_info = {
+                    'banda_total': banda_total,
+                    'bandas_por_transportista': bandas_por_transportista,
+                    'transportistas_unicos': list(transportistas_unicos)
+                }
 
     mineras = obtener_mineras_athena()
     transportistas = obtener_transportistas_global() if USE_ATHENA else []
@@ -443,6 +686,8 @@ def detalle():
                          transportista=transportista_nombre,
                          fecha=fecha,
                          registros=registros,
+                         datos_completos=datos_completos.to_dict('records') if datos_completos is not None and not datos_completos.empty else [],
+                         banda_info=banda_info,
                          mineras=mineras,
                          transportistas=transportistas)
 

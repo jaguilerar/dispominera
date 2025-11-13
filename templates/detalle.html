@@ -89,6 +89,56 @@
     </table>
 </div>
 
+{% if datos_completos %}
+<div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 25px; margin-top: 20px;">
+    <h2 style="margin-bottom: 20px; color: #333;">Resumen Completo por Camión ({{ datos_completos|length }} camiones)</h2>
+    
+    <table class="detail-table">
+        <thead>
+            <tr>
+                <th>Camión</th>
+                <th>Fecha</th>
+                <th>¿Es Licitado?</th>
+                <th>Transportista</th>
+                <th>Turnos Enviados</th>
+                <th>Conexión RCO</th>
+                <th>En Ruta</th>
+                <th>Planificado</th>
+                <th>Entregado Totalmente</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for dato in datos_completos %}
+            <tr>
+                <td><strong style="color: #3498db;">{{ dato.get('Camion', 'N/A') }}</strong></td>
+                <td>{{ dato.get('Fecha', 'N/A') }}</td>
+                <td>
+                    {% if dato.get('¿Es licitado?', 'No') == 'Si' %}
+                    <span style="color: #28a745; font-weight: bold;">✓ Sí</span>
+                    {% else %}
+                    <span style="color: #6c757d;">✗ No</span>
+                    {% endif %}
+                </td>
+                <td>{{ dato.get('Transportista', 'N/A') }}</td>
+                <td><strong>{{ dato.get('Turnos_enviados', 0) }}</strong></td>
+                <td><strong>{{ dato.get('Conexion_RCO', 0) }}</strong></td>
+                <td>{{ dato.get('En_ruta', 0) }}</td>
+                <td>{{ dato.get('Planificado', 0) }}</td>
+                <td>
+                    {% set entregado = dato.get('Entregado_totalmente', 0) %}
+                    {% if entregado > 0 %}
+                    <strong style="color: #28a745;">{{ entregado }}</strong>
+                    {% else %}
+                    <span style="color: #6c757d;">0</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
 <div style="margin-top: 20px; padding: 15px; background: #f8f8f8; border-radius: 8px;">
     <h3 style="margin-bottom: 10px; font-size: 16px;">Resumen</h3>
     <div style="display: flex; gap: 30px; flex-wrap: wrap;">
@@ -103,14 +153,33 @@
             <strong>Viajes pendientes:</strong> 
             {{ registros|selectattr('Entregado totalmente', 'equalto', 0)|list|length }}
         </div>
+        {% if datos_completos %}
         <div>
-            <strong>% Entregas completadas:</strong> 
+            <strong>Total turnos enviados:</strong> 
+            {{ datos_completos|sum(attribute='Turnos_enviados') }}
+        </div>
+        <div>
+            <strong>Total conexiones RCO:</strong> 
+            {{ datos_completos|sum(attribute='Conexion_RCO') }}
+        </div>
+        <div>
+            <strong>Camiones licitados:</strong> 
+            {{ datos_completos|selectattr('¿Es licitado?', 'equalto', 'Si')|list|length }}
+        </div>
+        {% endif %}
+        <div>
+            <strong>% Disponibilidad ( N° Turnos realizados / N° Turnos programados ) :</strong> 
             {% set entregados = registros|selectattr('Entregado totalmente', 'equalto', 1)|list|length %}
-            {% set porcentaje = (entregados / registros|length * 100)|round|int if registros|length > 0 else 0 %}
-            {% if porcentaje >= 85 %}
-            <span style="color: #28a745; font-weight: bold;">{{ porcentaje }}%</span>
+            {% if banda_info and banda_info.banda_total > 0 %}
+                {% set banda_total = banda_info.banda_total %}
+                {% set porcentaje = (entregados / banda_total * 100)|round|int %}
+                {% if porcentaje >= 85 %}
+                <span style="color: #28a745; font-weight: bold;">{{ porcentaje }}% ({{ entregados }}/{{ banda_total }})</span>
+                {% else %}
+                <span style="color: #dc3545; font-weight: bold;">{{ porcentaje }}% ({{ entregados }}/{{ banda_total }})</span>
+                {% endif %}
             {% else %}
-            <span style="color: #dc3545; font-weight: bold;">{{ porcentaje }}%</span>
+                <span style="color: #6c757d; font-weight: bold;">N/A (Sin información de banda)</span>
             {% endif %}
         </div>
     </div>

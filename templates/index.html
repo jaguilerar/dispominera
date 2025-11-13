@@ -444,12 +444,12 @@ function updateMatrix(matrizData, minera) {
         
         matrizData.fechas.forEach(fecha => {
             const celda = matrizData.datos[transportista][fecha];
-            const colorClass = celda.porcentaje >= 85 ? 'green' : 'red';
+            const colorClass = celda.porcentaje >= 80 ? 'green' : 'red';
             
             html += `<td>
                 <div class="percentage-circle ${colorClass}" 
                      onclick="goToDetail('${minera}', '${transportista}', '${celda.fecha_full}')"
-                     title="${celda.cumplidos} de ${celda.total} viajes">
+                     title="${celda.cumplidos} de ${celda.banda} (banda transportista)">
                     ${celda.porcentaje}%
                 </div>
             </td>`;
