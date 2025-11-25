@@ -15,7 +15,6 @@
     <div class="filter-group">
         <label class="filter-label">Año</label>
         <select id="añoSelect">
-            <option value="2023">2023</option>
             <option value="2024">2024</option>
             <option value="2025" selected>2025</option>
         </select>
@@ -48,13 +47,17 @@
     </div>
 </div>
 
+<div style="text-align: center; margin: 20px 0;">
+    <button id="applyFiltersBtn" class="btn btn-primary" onclick="loadDashboardData()">Aplicar Filtros</button>
+</div>
+
 <div class="chart-container">
-    <h2 class="chart-title">Entregas Totalmente por Día y Transportista</h2>
+    <h2 class="chart-title">Entregas por día y transportista </h2>
     <canvas id="barChart"></canvas>
 </div>
 
 <div class="compliance-matrix" id="matrixContainer">
-    <div class="loading">Seleccione Minera, Mes y Semana para ver los datos</div>
+    <div class="loading">Seleccione los filtros y presione "Aplicar Filtros" para ver los datos</div>
 </div>
 
 <div class="button-group" style="margin-top: 30px;">
@@ -99,14 +102,16 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('mineraSelect').addEventListener('change', onMineraChange);
     document.getElementById('añoSelect').addEventListener('change', onAñoChange);
     document.getElementById('mesSelect').addEventListener('change', onMesChange);
-    document.getElementById('semanaSelect').addEventListener('change', loadDashboardData);
+    document.getElementById('semanaSelect').addEventListener('change', onSemanaChange);
     
     // Cargar semanas del mes actual y establecer semana actual
     loadSemanas(mesActual, añoActual, true); // El tercer parámetro indica que debe seleccionar la semana actual
 });
 
 function onMineraChange() {
-    loadDashboardData();
+    // Solo limpiar la matriz cuando cambie la minera
+    document.getElementById('matrixContainer').innerHTML = 
+        '<div class="loading">Seleccione los filtros y presione "Aplicar Filtros" para ver los datos</div>';
 }
 
 function onAñoChange() {
@@ -115,7 +120,6 @@ function onAñoChange() {
     if (mes && año) {
         loadSemanas(parseInt(mes), parseInt(año), false); // No seleccionar automáticamente al cambiar año
     }
-    loadDashboardData();
 }
 
 function onMesChange() {
@@ -124,7 +128,19 @@ function onMesChange() {
     if (mes && año) {
         loadSemanas(parseInt(mes), parseInt(año), false); // No seleccionar automáticamente al cambiar mes
     }
-    loadDashboardData();
+}
+
+function onSemanaChange() {
+    // Solo actualizar el mensaje cuando cambie la semana
+    const minera = document.getElementById('mineraSelect').value;
+    const año = document.getElementById('añoSelect').value;
+    const mes = document.getElementById('mesSelect').value;
+    const semana = document.getElementById('semanaSelect').value;
+    
+    if (minera && año && mes && semana) {
+        document.getElementById('matrixContainer').innerHTML = 
+            '<div class="loading">Presione "Aplicar Filtros" para cargar los datos</div>';
+    }
 }
 
 async function loadSemanas(mes, año, seleccionarActual = false) {
@@ -185,7 +201,7 @@ async function loadDashboardData() {
     
     if (!minera || !año || !mes || !semana) {
         document.getElementById('matrixContainer').innerHTML = 
-            '<div class="loading">Seleccione Minera, Año, Mes y Semana para ver los datos</div>';
+            '<div class="loading">Seleccione Minera, Año, Mes y Semana, luego presione "Aplicar Filtros"</div>';
         return;
     }
     
@@ -444,15 +460,28 @@ function updateMatrix(matrizData, minera) {
         
         matrizData.fechas.forEach(fecha => {
             const celda = matrizData.datos[transportista][fecha];
-            const colorClass = celda.porcentaje >= 80 ? 'green' : 'red';
             
-            html += `<td>
-                <div class="percentage-circle ${colorClass}" 
-                     onclick="goToDetail('${minera}', '${transportista}', '${celda.fecha_full}')"
-                     title="${celda.cumplidos} de ${celda.banda} (banda transportista)">
-                    ${celda.porcentaje}%
-                </div>
-            </td>`;
+            // Verificar si es "OTRO TRANSPORTISTA"
+            if (transportista === 'OTRO TRANSPORTISTA' || celda.es_otro) {
+                // Para "OTRO TRANSPORTISTA", mostrar solo las entregas sin color ni porcentaje
+                html += `<td>
+                    <div class="percentage-circle neutral" 
+                         onclick="goToDetail('${minera}', '${transportista}', '${celda.fecha_full}')"
+                         title="Entregas realizadas: ${celda.total}">
+                        ${celda.total}
+                    </div>
+                </td>`;
+            } else {
+                // Para transportistas autorizados, mostrar porcentaje con colores
+                const colorClass = celda.porcentaje >= 80 ? 'green' : 'red';
+                html += `<td>
+                    <div class="percentage-circle ${colorClass}" 
+                         onclick="goToDetail('${minera}', '${transportista}', '${celda.fecha_full}')"
+                         title="${celda.cumplidos} de ${celda.banda} (banda transportista)">
+                        ${celda.porcentaje}%
+                    </div>
+                </td>`;
+            }
         });
         
         html += '</tr>';

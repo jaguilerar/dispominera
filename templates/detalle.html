@@ -142,45 +142,98 @@
 <div style="margin-top: 20px; padding: 15px; background: #f8f8f8; border-radius: 8px;">
     <h3 style="margin-bottom: 10px; font-size: 16px;">Resumen</h3>
     <div style="display: flex; gap: 30px; flex-wrap: wrap;">
-        <div>
-            <strong>Total de viajes:</strong> {{ registros|length }}
-        </div>
-        <div>
-            <strong>Viajes entregados:</strong> 
-            {{ registros|selectattr('Entregado totalmente', 'equalto', 1)|list|length }}
-        </div>
-        <div>
-            <strong>Viajes pendientes:</strong> 
-            {{ registros|selectattr('Entregado totalmente', 'equalto', 0)|list|length }}
-        </div>
-        {% if datos_completos %}
-        <div>
-            <strong>Total turnos enviados:</strong> 
-            {{ datos_completos|sum(attribute='Turnos_enviados') }}
-        </div>
-        <div>
-            <strong>Total conexiones RCO:</strong> 
-            {{ datos_completos|sum(attribute='Conexion_RCO') }}
-        </div>
-        <div>
-            <strong>Camiones licitados:</strong> 
-            {{ datos_completos|selectattr('¿Es licitado?', 'equalto', 'Si')|list|length }}
+        
+        <!-- Métrica de Disponibilidad Operacional (Nueva Lógica) -->
+        {% if banda_info and banda_info.disponibilidad_operacional %}
+        <div style="margin-top: 15px; padding: 15px; background: #e8f4f8; border-left: 4px solid #3498db; border-radius: 4px;">
+            <h4 style="margin: 0 0 10px 0; color: #2c3e50; font-size: 16px;">📊 Disponibilidad Operacional</h4>
+            {% set disp_op = banda_info.disponibilidad_operacional %}
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 10px;">
+                <div>
+                    <strong>Entregas Exitosas:</strong>
+                    <span style="color: #28a745; font-weight: bold; font-size: 18px;">{{ disp_op.entregas_exitosas_total }}</span>
+                    <br>
+                    <small style="color: #6c757d;">
+                        - Criterio A (Entregadas): {{ disp_op.entregas_criterio_a }}<br>
+                        - Criterio B (Con RCO): {{ disp_op.entregas_criterio_b }}
+                    </small>
+                </div>
+                <div>
+                    <strong>Total Turnos Enviados:</strong>
+                    <span style="font-weight: bold; font-size: 18px;">{{ disp_op.turnos_enviados_total }}</span>
+                </div>
+                <div>
+                    <strong>% Disponibilidad:</strong>
+                    {% if disp_op.disponibilidad_porcentaje >= 85 %}
+                    <span style="color: #28a745; font-weight: bold; font-size: 20px;">{{ disp_op.disponibilidad_porcentaje }}%</span>
+                    <span style="color: #28a745;">✓ Cumple</span>
+                    {% else %}
+                    <span style="color: #dc3545; font-weight: bold; font-size: 20px;">{{ disp_op.disponibilidad_porcentaje }}%</span>
+                    <span style="color: #dc3545;">✗ No Cumple</span>
+                    {% endif %}
+                    <br>
+                    <small style="color: #6c757d;">
+                        Fórmula: ({{ disp_op.entregas_exitosas_total }} / {{ disp_op.turnos_enviados_total }}) × 100
+                    </small>
+                </div>
+            </div>
+            <div style="margin-top: 10px; padding: 8px; background: #fff; border-radius: 4px; font-size: 12px; color: #495057;">
+                <strong>ℹ️ Criterios de Entrega Exitosa:</strong><br>
+                <strong>A)</strong> Pedido entregado correctamente (Estado: "Entregado totalmente" o "Recibí Conforme")<br>
+                <strong>B)</strong> Pedido NO entregado PERO con conexión RCO registrada (indica intento operacional válido)
+            </div>
         </div>
         {% endif %}
-        <div>
-            <strong>% Disponibilidad ( N° Turnos realizados / N° Turnos programados ) :</strong> 
+        
+        <!-- Métrica Tradicional (Por Banda) -->
+        <div style="margin-top: 15px; padding: 15px; background: #f8f9fa; border-left: 4px solid #6c757d; border-radius: 4px;">
+            <h4 style="margin: 0 0 10px 0; color: #495057; font-size: 16px;">📈 Disponibilidad Por Banda</h4>
             {% set entregados = registros|selectattr('Entregado totalmente', 'equalto', 1)|list|length %}
-            {% if banda_info and banda_info.banda_total > 0 %}
+            
+            {% if banda_info and banda_info.get('es_otro_transportista') %}
+                <div style="display: flex; align-items: center; gap: 15px;">
+                    <div>
+                        <strong>Entregas Realizadas:</strong>
+                        <span style="color: #495057; font-weight: bold; font-size: 18px;">{{ entregados }}</span>
+                    </div>
+                    <div style="padding: 8px 12px; background: #e9ecef; border-radius: 4px;">
+                        <small style="color: #6c757d;">Sin banda asignada - OTROS TRANSPORTISTAS</small>
+                    </div>
+                </div>
+            {% elif banda_info and banda_info.banda_total and banda_info.banda_total > 0 %}
                 {% set banda_total = banda_info.banda_total %}
                 {% set porcentaje = (entregados / banda_total * 100)|round|int %}
-                {% if porcentaje >= 85 %}
-                <span style="color: #28a745; font-weight: bold;">{{ porcentaje }}% ({{ entregados }}/{{ banda_total }})</span>
-                {% else %}
-                <span style="color: #dc3545; font-weight: bold;">{{ porcentaje }}% ({{ entregados }}/{{ banda_total }})</span>
-                {% endif %}
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px;">
+                    <div>
+                        <strong>Entregas Realizadas:</strong>
+                        <span style="font-weight: bold; font-size: 18px;">{{ entregados }}</span>
+                    </div>
+                    <div>
+                        <strong>Banda Total:</strong>
+                        <span style="font-weight: bold; font-size: 18px;">{{ banda_total }}</span>
+                    </div>
+                    <div>
+                        <strong>% Disponibilidad:</strong>
+                        {% if porcentaje >= 85 %}
+                        <span style="color: #28a745; font-weight: bold; font-size: 20px;">{{ porcentaje }}%</span>
+                        <span style="color: #28a745;">✓ Cumple</span>
+                        {% else %}
+                        <span style="color: #dc3545; font-weight: bold; font-size: 20px;">{{ porcentaje }}%</span>
+                        <span style="color: #dc3545;">✗ No Cumple</span>
+                        {% endif %}
+                        <br>
+                        <small style="color: #6c757d;">Fórmula: ({{ entregados }} / {{ banda_total }}) × 100</small>
+                    </div>
+                </div>
             {% else %}
-                <span style="color: #6c757d; font-weight: bold;">N/A (Sin información de banda)</span>
+                <div style="padding: 10px; background: #fff; border-radius: 4px; text-align: center;">
+                    <span style="color: #6c757d; font-weight: bold;">N/A - Sin información de banda disponible</span>
+                </div>
             {% endif %}
+            
+            <div style="margin-top: 10px; padding: 8px; background: #fff; border-radius: 4px; font-size: 12px; color: #495057;">
+                <strong>ℹ️ Método Tradicional:</strong> Calcula disponibilidad basándose en la banda de capacidad asignada por transportista (viajes programados por día).
+            </div>
         </div>
     </div>
 </div>

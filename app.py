@@ -125,6 +125,69 @@ def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
     return resultado_completo
 
 
+def calcular_disponibilidad_operacional(datos_completos):
+    """
+    Calcular la Disponibilidad Operacional según nueva métrica:
+    
+    Disponibilidad = (Entregas Exitosas) / (Total Turnos Enviados)
+    
+    Entregas Exitosas incluyen:
+    - Criterio A: Pedido fue entregado correctamente (Entregado_totalmente > 0)
+    - Criterio B: Pedido NO fue entregado PERO sí hubo conexión RCO (Entregado_totalmente == 0 AND Conexion_RCO > 0)
+    
+    Definiciones técnicas:
+    - "Entregado Correctamente": Estado 'Entregado totalmente' o 'Recibí Conforme' en SCR
+    - "Conexiones al RCO": Registro de conexión operacional en tabla RCO (cualquier evento > 0)
+    
+    Args:
+        datos_completos: DataFrame con columnas ['Turnos_enviados', 'Entregado_totalmente', 'Conexion_RCO']
+    
+    Returns:
+        dict con:
+            - entregas_exitosas_total: Total de entregas consideradas exitosas
+            - entregas_criterio_a: Entregas completadas correctamente
+            - entregas_criterio_b: Entregas fallidas pero con conexión RCO
+            - turnos_enviados_total: Total de turnos enviados
+            - disponibilidad_porcentaje: Porcentaje de disponibilidad operacional
+    """
+    if datos_completos is None or datos_completos.empty:
+        return {
+            'entregas_exitosas_total': 0,
+            'entregas_criterio_a': 0,
+            'entregas_criterio_b': 0,
+            'turnos_enviados_total': 0,
+            'disponibilidad_porcentaje': 0.0
+        }
+    
+    # Criterio A: Entregado correctamente
+    entregas_criterio_a = int(datos_completos['Entregado_totalmente'].sum())
+    
+    # Criterio B: No entregado PERO con conexión RCO
+    # Identificar registros donde NO se entregó (Entregado_totalmente == 0) PERO hubo conexión RCO (Conexion_RCO > 0)
+    criterio_b_mask = (datos_completos['Entregado_totalmente'] == 0) & (datos_completos['Conexion_RCO'] > 0)
+    entregas_criterio_b = int(criterio_b_mask.sum())
+    
+    # Total de entregas exitosas (Criterio A ∪ Criterio B)
+    entregas_exitosas_total = entregas_criterio_a + entregas_criterio_b
+    
+    # Total de turnos enviados
+    turnos_enviados_total = int(datos_completos['Turnos_enviados'].sum())
+    
+    # Calcular porcentaje de disponibilidad
+    if turnos_enviados_total > 0:
+        disponibilidad_porcentaje = (entregas_exitosas_total / turnos_enviados_total) * 100
+    else:
+        disponibilidad_porcentaje = 0.0
+    
+    return {
+        'entregas_exitosas_total': entregas_exitosas_total,
+        'entregas_criterio_a': entregas_criterio_a,
+        'entregas_criterio_b': entregas_criterio_b,
+        'turnos_enviados_total': turnos_enviados_total,
+        'disponibilidad_porcentaje': round(disponibilidad_porcentaje, 2)
+    }
+
+
 def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin):
     """
     Procesar y combinar datos de SCR, Turnos y RCO (replicando lógica del notebook)
@@ -450,22 +513,41 @@ def obtener_configuracion_bandas_transportista():
         },
         'SOCIEDAD DE TRANSPORTE NAZAR LTDA': {
             'LOS BRONCES': 6
-        },
-        
-        # Bandas por defecto basadas en minera (para transportistas no especificados)
-        'default': {
-            'MINA LA ESCONDIDA': 5,     # viajes por día por transportista
-            'QUADRA SIERRA GORDA': 3,
-            'ANDINA': 2,
-            'EL TENIENTE': 1,
-            'CASERONES': 2,
-            'SALARES NORTE': 2,
-            'MINERA CANDELARIA': 3,
-            'LOS BRONCES': 3,
-            'CODELCO': 4
         }
     }
     return bandas_transportista
+
+
+def obtener_transportistas_autorizados(minera):
+    """Obtener transportistas autorizados para una minera específica"""
+    bandas = obtener_configuracion_bandas_transportista()
+    transportistas_autorizados = set()
+    
+    for transportista, mineras_config in bandas.items():
+        if minera in mineras_config:
+            transportistas_autorizados.add(transportista)
+    
+    return transportistas_autorizados
+
+
+def es_transportista_autorizado(transportista, minera):
+    """Verificar si un transportista está autorizado para una minera"""
+    transportistas_autorizados = obtener_transportistas_autorizados(minera)
+    
+    # Normalizar nombre del transportista para búsqueda
+    transportista_normalizado = transportista.upper().strip()
+    
+    # Buscar exacto
+    if transportista_normalizado in [t.upper() for t in transportistas_autorizados]:
+        return True
+    
+    # Buscar por patrones parciales
+    for nombre_autorizado in transportistas_autorizados:
+        if (nombre_autorizado.upper() in transportista_normalizado or 
+            transportista_normalizado in nombre_autorizado.upper()):
+            return True
+    
+    return False
 
 
 def calcular_banda_transportista(transportista, minera, bandas_config=None):
@@ -473,27 +555,23 @@ def calcular_banda_transportista(transportista, minera, bandas_config=None):
     if bandas_config is None:
         bandas_config = obtener_configuracion_bandas_transportista()
     
+    # Verificar si es transportista autorizado
+    if not es_transportista_autorizado(transportista, minera):
+        return None  # No tiene banda, se medirá por entregas
+    
     # Normalizar nombre del transportista para búsqueda
     transportista_normalizado = transportista.upper().strip()
     
     # Buscar configuración específica del transportista (exacta)
-    if transportista_normalizado in bandas_config and minera in bandas_config[transportista_normalizado]:
-        return bandas_config[transportista_normalizado][minera]
+    for nombre_config, mineras_config in bandas_config.items():
+        if minera in mineras_config:
+            if (transportista_normalizado == nombre_config.upper() or
+                nombre_config.upper() in transportista_normalizado or 
+                transportista_normalizado in nombre_config.upper()):
+                return mineras_config[minera]
     
-    # Buscar por patrones parciales (para manejo de variaciones de nombres)
-    for nombre_config in bandas_config:
-        if nombre_config != 'default':
-            # Buscar si el nombre configurado está contenido en el nombre del transportista
-            if nombre_config.upper() in transportista_normalizado or transportista_normalizado in nombre_config.upper():
-                if minera in bandas_config[nombre_config]:
-                    return bandas_config[nombre_config][minera]
-    
-    # Usar banda por defecto de la minera
-    if minera in bandas_config['default']:
-        return bandas_config['default'][minera]
-    
-    # Banda por defecto general
-    return 3
+    # Si llegamos aquí, es un error en la configuración
+    return None
 
 
 def obtener_transportistas_athena(minera_nombre, fecha_inicio, fecha_fin):
@@ -513,8 +591,21 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
 
     tabla_base, resumen_diario = procesar_datos_athena(df, viajes_min, viajes_max)
 
-    # Obtener transportistas únicos
-    transportistas_unicos = sorted(tabla_base['Transportista'].unique())
+    # Separar transportistas autorizados y otros
+    transportistas_unicos = tabla_base['Transportista'].unique()
+    transportistas_autorizados = []
+    otros_transportistas = []
+    
+    for transportista in transportistas_unicos:
+        if es_transportista_autorizado(transportista, minera_nombre):
+            transportistas_autorizados.append(transportista)
+        else:
+            otros_transportistas.append(transportista)
+    
+    # Lista final para el gráfico
+    transportistas_finales = sorted(transportistas_autorizados)
+    if otros_transportistas:
+        transportistas_finales.append('OTRO TRANSPORTISTA')
     
     # Crear estructura para gráfico apilado
     fechas_ordenadas = sorted(tabla_base['Fecha'].unique())
@@ -524,8 +615,8 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
         fecha_str = fecha.strftime('%d-%m')
         datos_fecha = {'fecha': fecha_str, 'total': 0}
         
-        # Agregar datos por transportista para esta fecha
-        for transportista in transportistas_unicos:
+        # Agregar datos por transportista autorizado
+        for transportista in transportistas_autorizados:
             datos_transportista = tabla_base[
                 (tabla_base['Fecha'] == fecha) & 
                 (tabla_base['Transportista'] == transportista)
@@ -533,6 +624,19 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
             cantidad = int(datos_transportista['Entregado totalmente'].sum()) if not datos_transportista.empty else 0
             datos_fecha[transportista] = cantidad
             datos_fecha['total'] += cantidad
+        
+        # Agregar datos agrupados de "otros" transportistas
+        if otros_transportistas:
+            cantidad_otros = 0
+            for transportista in otros_transportistas:
+                datos_transportista = tabla_base[
+                    (tabla_base['Fecha'] == fecha) & 
+                    (tabla_base['Transportista'] == transportista)
+                ]
+                cantidad_otros += int(datos_transportista['Entregado totalmente'].sum()) if not datos_transportista.empty else 0
+            
+            datos_fecha['OTRO TRANSPORTISTA'] = cantidad_otros
+            datos_fecha['total'] += cantidad_otros
         
         # Verificar si cumple con el rango
         datos_fecha['cumple'] = viajes_min <= datos_fecha['total'] <= viajes_max
@@ -543,7 +647,7 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
         'minimo': viajes_min,
         'maximo': viajes_max,
         'tipo': 'apilado',
-        'transportistas': transportistas_unicos
+        'transportistas': transportistas_finales
     }
 
     return grafico_data
@@ -556,22 +660,36 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
 
     tabla_base, resumen_diario = procesar_datos_athena(df, viajes_min, viajes_max)
 
+    # Separar transportistas autorizados y otros
     transportistas_unicos = tabla_base['Transportista'].unique()
+    transportistas_autorizados = []
+    otros_transportistas_data = tabla_base[tabla_base['Transportista'].isin([])].copy()  # Inicializar vacío
+    
+    for transportista in transportistas_unicos:
+        if es_transportista_autorizado(transportista, minera_nombre):
+            transportistas_autorizados.append(transportista)
+        else:
+            # Agregar a "otros" transportistas
+            datos_transportista = tabla_base[tabla_base['Transportista'] == transportista]
+            otros_transportistas_data = pd.concat([otros_transportistas_data, datos_transportista], ignore_index=True)
+    
+    # Lista final de transportistas para mostrar
+    transportistas_finales = transportistas_autorizados.copy()
+    if not otros_transportistas_data.empty:
+        transportistas_finales.append('OTRO TRANSPORTISTA')
+    
     fechas = [d.strftime('%d-%m') for d in sorted(resumen_diario['Fecha'].unique())]
 
-    # Obtener configuración de bandas por transportista
-    bandas_config = obtener_configuracion_bandas_transportista()
-
     matriz_data = {
-        'transportistas': list(transportistas_unicos),
+        'transportistas': transportistas_finales,
         'fechas': fechas,
         'datos': {},
         'bandas_transportistas': {}  # Para referencia en el frontend
     }
 
-    for transportista_nombre in transportistas_unicos:
-        # Obtener banda específica del transportista para esta minera
-        banda_transportista = calcular_banda_transportista(transportista_nombre, minera_nombre, bandas_config)
+    # Procesar transportistas autorizados
+    for transportista_nombre in transportistas_autorizados:
+        banda_transportista = calcular_banda_transportista(transportista_nombre, minera_nombre)
         matriz_data['bandas_transportistas'][transportista_nombre] = banda_transportista
         
         matriz_data['datos'][transportista_nombre] = {}
@@ -581,20 +699,40 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
             viajes_realizados = int(datos_trans['Entregado totalmente'].sum())
             
             # Calcular disponibilidad: (viajes realizados / banda transportista) * 100
-            if banda_transportista > 0:
+            if banda_transportista and banda_transportista > 0:
                 disponibilidad = (viajes_realizados / banda_transportista) * 100
-                # Limitar al 100% máximo para mejor visualización
                 disponibilidad = min(100, disponibilidad)
             else:
                 disponibilidad = 0
 
             matriz_data['datos'][transportista_nombre][fecha_str] = {
-                'porcentaje': round(disponibilidad, 1),  # Disponibilidad como %
-                'total': viajes_realizados,             # Viajes realizados
-                'banda': banda_transportista,           # Capacidad del transportista
-                'cumplidos': viajes_realizados,         # Compatibilidad con frontend
+                'porcentaje': round(disponibilidad, 1),
+                'total': viajes_realizados,
+                'banda': banda_transportista,
+                'cumplidos': viajes_realizados,
                 'transportista_id': 0,
                 'fecha_full': row['Fecha'].strftime('%Y-%m-%d')
+            }
+    
+    # Procesar "OTRO TRANSPORTISTA" (medido por entregas, no por banda)
+    if not otros_transportistas_data.empty:
+        matriz_data['bandas_transportistas']['OTRO TRANSPORTISTA'] = None  # Sin banda
+        matriz_data['datos']['OTRO TRANSPORTISTA'] = {}
+        
+        for _, row in resumen_diario.iterrows():
+            fecha_str = row['Fecha'].strftime('%d-%m')
+            datos_otros = otros_transportistas_data[otros_transportistas_data['Fecha'] == row['Fecha']]
+            entregas_realizadas = int(datos_otros['Entregado totalmente'].sum())
+            
+            # Para "otros" no usamos porcentaje de banda, solo mostramos entregas
+            matriz_data['datos']['OTRO TRANSPORTISTA'][fecha_str] = {
+                'porcentaje': 0,  # No aplica concepto de banda
+                'total': entregas_realizadas,
+                'banda': None,  # Sin banda asignada
+                'cumplidos': entregas_realizadas,
+                'transportista_id': 0,
+                'fecha_full': row['Fecha'].strftime('%Y-%m-%d'),
+                'es_otro': True  # Marca especial para el frontend
             }
 
     return matriz_data
@@ -650,33 +788,72 @@ def detalle():
         datos_completos = obtener_datos_completos_athena(minera_nombre, fecha_obj, fecha_obj)
         
         if datos_completos is not None and not datos_completos.empty:
-            if transportista_nombre:
-                datos_completos = datos_completos[datos_completos['Transportista'] == transportista_nombre]
-            
-            # Para mantener compatibilidad con el template existente, 
-            # también obtenemos los datos SCR básicos para los registros individuales
-            df_scr = obtener_datos_desde_athena(minera_nombre, fecha_obj, fecha_obj)
-            if df_scr is not None and not df_scr.empty:
+            # Manejar el caso especial de "OTRO TRANSPORTISTA"
+            if transportista_nombre == 'OTRO TRANSPORTISTA':
+                # Filtrar solo transportistas no autorizados
+                transportistas_no_autorizados = []
+                for transportista in datos_completos['Transportista'].unique():
+                    if not es_transportista_autorizado(transportista, minera_nombre):
+                        transportistas_no_autorizados.append(transportista)
+                
+                datos_completos_filtrados = datos_completos[
+                    datos_completos['Transportista'].isin(transportistas_no_autorizados)
+                ]
+                
+                # Para los registros SCR, también incluir todos los transportistas no autorizados
+                df_scr = obtener_datos_desde_athena(minera_nombre, fecha_obj, fecha_obj)
+                if df_scr is not None and not df_scr.empty:
+                    df_scr_filtrado = df_scr[
+                        df_scr['Transportista'].isin(transportistas_no_autorizados)
+                    ]
+                    registros = df_scr_filtrado.to_dict('records')
+            else:
+                # Caso normal: filtrar por transportista específico
                 if transportista_nombre:
-                    df_scr = df_scr[df_scr['Transportista'] == transportista_nombre]
-                registros = df_scr.to_dict('records')
+                    datos_completos_filtrados = datos_completos[datos_completos['Transportista'] == transportista_nombre]
+                else:
+                    datos_completos_filtrados = datos_completos
+                
+                # Para mantener compatibilidad con el template existente, 
+                # también obtenemos los datos SCR básicos para los registros individuales
+                df_scr = obtener_datos_desde_athena(minera_nombre, fecha_obj, fecha_obj)
+                if df_scr is not None and not df_scr.empty:
+                    if transportista_nombre:
+                        df_scr = df_scr[df_scr['Transportista'] == transportista_nombre]
+                    registros = df_scr.to_dict('records')
             
-            # Calcular bandas por transportista usando los datos completos
-            if not datos_completos.empty:
-                transportistas_unicos = datos_completos['Transportista'].unique()
+            # Calcular bandas por transportista usando todos los transportistas con datos completos
+            if not datos_completos_filtrados.empty:
+                transportistas_unicos = datos_completos_filtrados['Transportista'].unique()
                 banda_total = 0
                 bandas_por_transportista = {}
                 
-                for transp in transportistas_unicos:
-                    banda = calcular_banda_transportista(transp, minera_nombre)
-                    bandas_por_transportista[transp] = banda
-                    banda_total += banda
+                if transportista_nombre == 'OTRO TRANSPORTISTA':
+                    # Para OTRO TRANSPORTISTA, no calcular bandas sino contar entregas
+                    for transp in transportistas_unicos:
+                        bandas_por_transportista[transp] = None  # Sin banda
+                    banda_total = None  # No aplica concepto de banda total
+                else:
+                    # Caso normal: calcular bandas
+                    for transp in transportistas_unicos:
+                        banda = calcular_banda_transportista(transp, minera_nombre)
+                        bandas_por_transportista[transp] = banda
+                        if banda:
+                            banda_total += banda
+                
+                # Calcular disponibilidad operacional según nueva métrica
+                disponibilidad_operacional = calcular_disponibilidad_operacional(datos_completos_filtrados)
                 
                 banda_info = {
                     'banda_total': banda_total,
                     'bandas_por_transportista': bandas_por_transportista,
-                    'transportistas_unicos': list(transportistas_unicos)
+                    'transportistas_unicos': list(transportistas_unicos),
+                    'es_otro_transportista': transportista_nombre == 'OTRO TRANSPORTISTA',
+                    'disponibilidad_operacional': disponibilidad_operacional
                 }
+                
+                # Usar los datos filtrados para el template
+                datos_completos = datos_completos_filtrados
 
     mineras = obtener_mineras_athena()
     transportistas = obtener_transportistas_global() if USE_ATHENA else []
