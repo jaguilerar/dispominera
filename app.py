@@ -1,4 +1,6 @@
 from flask import Flask, render_template, request, jsonify
+from flask_httpauth import HTTPBasicAuth
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import os
 import pandas as pd
@@ -18,6 +20,29 @@ except ImportError:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', '')
+
+# ============================================
+# CONFIGURACIÓN DE AUTENTICACIÓN
+# ============================================
+auth = HTTPBasicAuth()
+
+# Usuarios permitidos (desde variables de entorno)
+USERS = {
+    os.environ.get('APP_USER'): generate_password_hash(
+        os.environ.get('APP_PASSWORD')
+    )
+}
+
+@auth.verify_password
+def verify_password(username, password):
+    """Verificar credenciales de usuario"""
+    if username in USERS and check_password_hash(USERS.get(username), password):
+        return username
+    return None
+# ============================================
+# FIN CONFIGURACIÓN DE AUTENTICACIÓN
+# ============================================
+
 
 # Configuración de AWS Athena (usar variables de entorno en producción)
 AWS_CONFIG = {
@@ -757,6 +782,7 @@ def obtener_transportistas_global():
 
 # Rutas principales
 @app.route('/')
+@auth.login_required
 def index():
     """Vista principal - Dashboard (lista de mineras predefinidas)"""
     mineras = obtener_mineras_athena()
@@ -765,6 +791,7 @@ def index():
 
 
 @app.route('/detalle')
+@auth.login_required
 def detalle():
     """Vista de detalle de transportista (Athena)
 
@@ -870,6 +897,7 @@ def detalle():
 
 
 @app.route('/api/dashboard_data')
+@auth.login_required
 def dashboard_data():
     """API endpoint para obtener datos del dashboard (Athena-only)
 
@@ -919,6 +947,7 @@ def dashboard_data():
 
 
 @app.route('/api/semanas/<int:mes>')
+@auth.login_required
 def obtener_semanas(mes):
     """Obtener semanas disponibles para un mes"""
     año = request.args.get('año', type=int, default=datetime.now().year)
@@ -954,6 +983,7 @@ def calcular_rango_semana(año, mes, semana):
 # Removed SQLite-based helpers. Use Athena helpers: obtener_datos_grafico_athena and obtener_datos_matriz_athena
 
 @app.route('/admin/mineras')
+@auth.login_required
 def admin_mineras():
     """Gestión de mineras y asociaciones"""
     mineras = obtener_mineras_athena()
@@ -962,6 +992,7 @@ def admin_mineras():
 
 
 @app.route('/api/debug/transportistas')
+@auth.login_required
 def debug_transportistas():
     """Ruta temporal para identificar nombres exactos de transportistas"""
     if not USE_ATHENA:
@@ -1001,6 +1032,7 @@ def debug_transportistas():
 
 
 @app.route('/api/mineras', methods=['GET', 'POST'])
+@auth.login_required
 def api_mineras():
     """Endpoints de mineras — Athena-only read API. POST no soportado."""
     if request.method == 'GET':
@@ -1026,5 +1058,6 @@ if __name__ == '__main__':
     print(f"🚀 Iniciando aplicación en puerto {port}")
     print(f"🔧 Debug mode: {debug}")
     print(f"⚡ Athena disponible: {ATHENA_AVAILABLE}")
+    print(f"🔐 Autenticación HTTP Basic activada")
     
     app.run(host='0.0.0.0', port=port, debug=debug)
