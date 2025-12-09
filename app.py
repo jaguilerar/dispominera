@@ -60,6 +60,7 @@ TABLA_PEDIDOS = os.getenv('TABLA_PEDIDOS', '')
 DATABASE_DISPOMATE = os.getenv('DATABASE_DISPOMATE', '')
 TABLA_TURNOS = os.getenv('TABLA_TURNOS', '')
 TABLA_RCO = os.getenv('TABLA_RCO', '')
+TABLA_FLOTA = os.getenv('TABLA_FLOTA', '')
 
 
 # Forzar por defecto el uso de Athena si la librería está disponible.
@@ -145,7 +146,7 @@ def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
         df_rco = pd.DataFrame()
 
     # 4. Procesar y combinar datos como en el notebook
-    resultado_completo = procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin)
+    resultado_completo = procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin, minera_nombre)
     
     return resultado_completo
 
@@ -165,7 +166,7 @@ def calcular_disponibilidad_operacional(datos_completos):
     - "Conexiones al RCO": Registro de conexión operacional en tabla RCO (cualquier evento > 0)
     
     Args:
-        datos_completos: DataFrame con columnas ['Turnos_enviados', 'Entregado_totalmente', 'Conexion_RCO']
+        datos_completos: DataFrame con columnas ['Turnos_enviados', 'Entregado_totalmente', 'Conexion_RCO', '¿Es licitado?']
     
     Returns:
         dict con:
@@ -174,6 +175,9 @@ def calcular_disponibilidad_operacional(datos_completos):
             - entregas_criterio_b: Entregas fallidas pero con conexión RCO
             - turnos_enviados_total: Total de turnos enviados
             - disponibilidad_porcentaje: Porcentaje de disponibilidad operacional
+            - entregas_licitadas: Total de entregas realizadas por flota licitada
+            - entregas_totales: Total de entregas (Entregado_totalmente > 0)
+            - disponibilidad_licitada_porcentaje: Porcentaje de entregas por flota licitada
     """
     if datos_completos is None or datos_completos.empty:
         return {
@@ -181,7 +185,10 @@ def calcular_disponibilidad_operacional(datos_completos):
             'entregas_criterio_a': 0,
             'entregas_criterio_b': 0,
             'turnos_enviados_total': 0,
-            'disponibilidad_porcentaje': 0.0
+            'disponibilidad_porcentaje': 0.0,
+            'entregas_licitadas': 0,
+            'entregas_totales': 0,
+            'disponibilidad_licitada_porcentaje': 0.0
         }
     
     # Criterio A: Entregado correctamente
@@ -198,31 +205,61 @@ def calcular_disponibilidad_operacional(datos_completos):
     # Total de turnos enviados
     turnos_enviados_total = int(datos_completos['Turnos_enviados'].sum())
     
-    # Calcular porcentaje de disponibilidad
+    # Calcular porcentaje de disponibilidad operacional
     if turnos_enviados_total > 0:
         disponibilidad_porcentaje = (entregas_exitosas_total / turnos_enviados_total) * 100
     else:
         disponibilidad_porcentaje = 0.0
+    
+    # Calcular Disponibilidad Licitada
+    # Entregas totales: todas las entregas completadas (Entregado_totalmente > 0)
+    entregas_totales = int((datos_completos['Entregado_totalmente'] > 0).sum())
+    
+    # Entregas licitadas: entregas completadas por flota licitada (¿Es licitado? == 'Si' AND Entregado_totalmente > 0)
+    entregas_licitadas = int(
+        ((datos_completos['¿Es licitado?'] == 'Si') & (datos_completos['Entregado_totalmente'] > 0)).sum()
+    )
+    
+    # Calcular porcentaje de disponibilidad licitada
+    if entregas_totales > 0:
+        disponibilidad_licitada_porcentaje = (entregas_licitadas / entregas_totales) * 100
+    else:
+        disponibilidad_licitada_porcentaje = 0.0
     
     return {
         'entregas_exitosas_total': entregas_exitosas_total,
         'entregas_criterio_a': entregas_criterio_a,
         'entregas_criterio_b': entregas_criterio_b,
         'turnos_enviados_total': turnos_enviados_total,
-        'disponibilidad_porcentaje': round(disponibilidad_porcentaje, 2)
+        'disponibilidad_porcentaje': round(disponibilidad_porcentaje, 2),
+        'entregas_licitadas': entregas_licitadas,
+        'entregas_totales': entregas_totales,
+        'disponibilidad_licitada_porcentaje': round(disponibilidad_licitada_porcentaje, 2)
     }
 
 
-def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin):
+def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin, minera_nombre=None):
     """
     Procesar y combinar datos de SCR, Turnos y RCO (replicando lógica del notebook)
+    
+    Args:
+        df_scr: DataFrame con datos SCR
+        df_turnos: DataFrame con datos de turnos
+        df_rco: DataFrame con datos RCO
+        fecha_inicio: Fecha inicial del rango
+        fecha_fin: Fecha final del rango
+        minera_nombre: Nombre de la minera (opcional, para obtener flota licitada)
     """
     # Obtener vehículos únicos del SCR
     vehiculos_totales = df_scr['vehiclereal'].dropna().unique()
     vehiculos_totales = np.sort(vehiculos_totales.astype(int))
     
-    # Lista de vehículos licitados (basada en el notebook)
-    vehiculos_licitados = [4002, 4003, 4049, 8054, 8120, 8348, 8820]
+    # Obtener vehículos licitados desde la tabla de flota o usar lista por defecto
+    if minera_nombre:
+        vehiculos_licitados = obtener_vehiculos_licitados_por_minera(minera_nombre)
+    else:
+        # Fallback a lista hardcodeada
+        vehiculos_licitados = [4002, 4003, 4049, 8054, 8120, 8348, 8820]
     
     # Crear tabla base combinando todos los vehículos con todas las fechas
     fechas_rango = pd.date_range(start=fecha_inicio, end=fecha_fin, freq='D')
@@ -273,7 +310,23 @@ def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin)
     if not df_rco.empty:
         # Filtrar solo vehículos que están en vehiculos_totales y crear copia explícita
         df_rco_filtrado = df_rco[df_rco['codigo_tanque'].isin(vehiculos_totales)].copy()
-        df_rco_filtrado['fecha_rco'] = pd.to_datetime(df_rco_filtrado['fecha_carga_particion']).dt.date
+        
+        # Convertir fecha_conexion_utc a zona horaria de Santiago de Chile
+        df_rco_filtrado['fecha_conexion_utc'] = pd.to_datetime(df_rco_filtrado['fecha_conexion_utc'])
+        df_rco_filtrado['fecha_conexion_santiago'] = (
+            df_rco_filtrado['fecha_conexion_utc']
+            .dt.tz_localize('UTC')
+            .dt.tz_convert('America/Santiago')
+        )
+        
+        # Hora límite para contar conexión al día siguiente (23:30 por defecto)
+        # Si la hora es mayor o igual a 23:30, contar para el día siguiente
+        hora_corte = pd.Timestamp('23:30').time()
+        df_rco_filtrado['fecha_rco'] = df_rco_filtrado['fecha_conexion_santiago'].apply(
+            lambda x: (x + pd.Timedelta(days=1)).date()
+            if x.time() >= hora_corte
+            else x.date()
+        )
         
         conteos_rco = (df_rco_filtrado
                       .groupby(['codigo_tanque', 'fecha_rco'])
@@ -490,6 +543,107 @@ def obtener_mineras_codelco():
 def es_minera_codelco(minera_nombre):
     """Verificar si una minera pertenece al grupo CODELCO"""
     return minera_nombre in obtener_mineras_codelco()
+
+
+def obtener_mapeo_uso_mineras():
+    """Obtener mapeo entre valores de 'uso' en tabla flota y nombres de mineras"""
+    mapeo_uso = {
+        # Codelco (agrupación)
+        'RADOMIRO TOMIC': 'CODELCO',
+        'MINISTRO HALES': 'CODELCO',
+        'CODELCO CHUQUI': 'CODELCO',
+        'CODELCO CHUQUI PC': 'CODELCO',
+        'APOYO CODELCO': 'CODELCO',
+        
+        # Mineras individuales
+        'CASERONES': 'CASERONES',
+        'CODELCO TENIENTE': 'EL TENIENTE',
+        'LOS BRONCES': 'LOS BRONCES',
+        'CODELCO ANDINA': 'ANDINA',
+        'QUADRA': 'QUADRA SIERRA GORDA',
+        'SALARES NORTE': 'SALARES NORTE',
+        'CANDELARIA': 'MINERA CANDELARIA'
+    }
+    return mapeo_uso
+
+
+def obtener_flota_licitada_athena(minera_nombre):
+    """
+    Obtener vehículos de flota licitada desde Athena para una minera específica
+    
+    Args:
+        minera_nombre: Nombre de la minera (según nomenclatura de la app)
+    
+    Returns:
+        DataFrame con columnas: codigo_tanque, nombre_transportista, estado, uso
+        o DataFrame vacío si no hay datos o hay error
+    """
+    if not USE_ATHENA:
+        return pd.DataFrame()
+    
+    # Validar que existe la tabla de flota configurada
+    if not TABLA_FLOTA:
+        print("TABLA_FLOTA no está configurada en las variables de entorno")
+        return pd.DataFrame()
+    
+    # Obtener mapeo de uso a mineras
+    mapeo_uso = obtener_mapeo_uso_mineras()
+    
+    # Invertir el mapeo para buscar por minera
+    uso_values = [uso for uso, minera in mapeo_uso.items() if minera == minera_nombre]
+    
+    if not uso_values:
+        print(f"No se encontró mapeo de uso para minera: {minera_nombre}")
+        return pd.DataFrame()
+    
+    # Crear condiciones para la query con escape correcto
+    uso_conditions = [f"'{uso}'" for uso in uso_values]
+    uso_in_clause = ', '.join(uso_conditions)
+    
+    query = f"""
+    SELECT 
+        codigo_tanque,
+        nombre_transportista,
+        estado,
+        uso
+    FROM {DATABASE_DISPOMATE}.{TABLA_FLOTA}
+    WHERE uso IN ({uso_in_clause})
+      AND estado = 'Activo'
+    ORDER BY codigo_tanque
+    """
+    
+    try:
+        df_flota = sql_athena(query)
+        if df_flota.empty:
+            print(f"No se encontraron vehículos licitados para {minera_nombre}")
+            return pd.DataFrame()
+        
+        # Convertir codigo_tanque a int
+        df_flota['codigo_tanque'] = df_flota['codigo_tanque'].astype(int)
+        
+        return df_flota
+    except Exception as e:
+        print(f"Error obteniendo flota licitada de Athena: {e}")
+        return pd.DataFrame()
+
+
+def obtener_vehiculos_licitados_por_minera(minera_nombre):
+    """
+    Obtener lista de códigos de vehículos licitados para una minera
+    
+    Args:
+        minera_nombre: Nombre de la minera
+    
+    Returns:
+        Lista de códigos de vehículos (int)
+    """
+    df_flota = obtener_flota_licitada_athena(minera_nombre)
+    
+    if df_flota.empty:
+        # Fallback a lista hardcodeada (mantener compatibilidad)
+        return [4002, 4003, 4049, 8054, 8120, 8348, 8820]
+    
+    return sorted(df_flota['codigo_tanque'].unique().tolist())
 
 
 def obtener_configuracion_viajes():
@@ -933,6 +1087,17 @@ def dashboard_data():
 
     grafico_data = obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max)
     matriz_data = obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max)
+
+    # Agregar información de bandas por transportista al grafico_data
+    bandas_por_transportista = {}
+    for transportista in grafico_data.get('transportistas', []):
+        if transportista != 'OTRO TRANSPORTISTA':
+            banda = calcular_banda_transportista(transportista, minera_nombre)
+            bandas_por_transportista[transportista] = banda
+        else:
+            bandas_por_transportista[transportista] = None
+    
+    grafico_data['bandas_transportista'] = bandas_por_transportista
 
     return jsonify({
         'grafico': grafico_data,

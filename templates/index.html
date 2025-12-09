@@ -309,6 +309,10 @@ function updateChart(graficoData) {
         borderWidth: 1
     }));
     
+    // Guardar referencia a los datos originales y configuración de bandas del transportista
+    window.graficoDataGlobal = graficoData;
+    window.bandasTransportista = {}; // Almacenar bandas por transportista
+    
     barChart = new Chart(ctx, {
         type: 'bar',
         data: {
@@ -356,6 +360,20 @@ function updateChart(graficoData) {
                         font: {
                             size: 12
                         }
+                    },
+                    onClick: function(e, legendItem, legend) {
+                        // Comportamiento por defecto de Chart.js para mostrar/ocultar datasets
+                        const index = legendItem.datasetIndex;
+                        const ci = legend.chart;
+                        const meta = ci.getDatasetMeta(index);
+                        
+                        // Toggle visibility
+                        meta.hidden = meta.hidden === null ? !ci.data.datasets[index].hidden : null;
+                        
+                        // Recalcular bandas basadas en transportistas visibles
+                        recalcularBandas(ci);
+                        
+                        ci.update();
                     }
                 },
                 title: {
@@ -435,6 +453,54 @@ function generateColors(count) {
     }
     
     return [...corporateColors, ...extraColors];
+}
+
+// Función para recalcular bandas según transportistas visibles
+function recalcularBandas(chart) {
+    if (!window.graficoDataGlobal || !window.graficoDataGlobal.bandas_transportista) {
+        return; // No hay información de bandas por transportista
+    }
+    
+    // Obtener datasets visibles
+    const datasetsVisibles = chart.data.datasets.filter((dataset, index) => {
+        const meta = chart.getDatasetMeta(index);
+        return !meta.hidden;
+    });
+    
+    if (datasetsVisibles.length === 0) {
+        return; // No hay datasets visibles
+    }
+    
+    // Calcular banda total de los transportistas visibles
+    let bandaTotal = 0;
+    datasetsVisibles.forEach(dataset => {
+        const transportista = dataset.label;
+        const banda = window.graficoDataGlobal.bandas_transportista[transportista];
+        if (banda && banda > 0) {
+            bandaTotal += banda;
+        }
+    });
+    
+    // Si no hay bandas definidas o son todas null/undefined, usar bandas originales
+    if (bandaTotal === 0) {
+        bandaTotal = window.graficoDataGlobal.maximo;
+    }
+    
+    // Actualizar anotaciones de líneas
+    const annotations = chart.options.plugins.annotation.annotations;
+    
+    // Actualizar línea mínima (puede ser proporcional o mantener original)
+    // Por simplicidad, mantenemos la lógica de banda total
+    const bandaMinima = Math.floor(bandaTotal * 0.9); // 90% de la banda total como mínimo
+    const bandaMaxima = bandaTotal;
+    
+    annotations.lineMin.yMin = bandaMinima;
+    annotations.lineMin.yMax = bandaMinima;
+    annotations.lineMin.label.content = `Mínimo (${bandaMinima})`;
+    
+    annotations.lineMax.yMin = bandaMaxima;
+    annotations.lineMax.yMax = bandaMaxima;
+    annotations.lineMax.label.content = `Máximo (${bandaMaxima})`;
 }
 
 function updateMatrix(matrizData, minera) {
