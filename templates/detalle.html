@@ -247,6 +247,104 @@
 </div>
 {% endif %}
 
+<!-- Tabla de Flota Licitada con Actividad -->
+{% if flota_licitada %}
+<div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 25px; margin-top: 30px;">
+    <h2 style="margin-bottom: 20px; color: #2c3e50; font-size: 20px;">📋 Actividad de Flota Licitada - {{ minera if minera else 'Minera' }}</h2>
+    <p style="color: #6c757d; font-size: 14px; margin-bottom: 20px;">
+        {% if fecha %}
+        Actividad detallada de todos los vehículos licitados para esta minera en la fecha {{ fecha }}.
+        {% else %}
+        Todos los vehículos licitados para esta minera. Seleccione una fecha para ver la actividad detallada.
+        {% endif %}
+    </p>
+    
+    <table class="detail-table">
+        <thead>
+            <tr>
+                <th>Código Tanque</th>
+                <th>Transportista</th>
+                <th>Turnos Enviados</th>
+                <th>Conexiones RCO</th>
+                <th>Entregas Realizadas</th>
+                <th>Destinos</th>
+                <th>Estado</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for vehiculo in flota_licitada %}
+            <tr style="{% if vehiculo.tiene_actividad %}background-color: #f0f9ff;{% endif %}">
+                <td><strong style="color: #3498db;">{{ vehiculo.codigo_tanque }}</strong></td>
+                <td style="font-size: 13px;">{{ vehiculo.nombre_transportista }}</td>
+                <td style="text-align: center;">
+                    {% if vehiculo.turnos_enviados > 0 %}
+                    <strong style="color: #17a2b8;">{{ vehiculo.turnos_enviados }}</strong>
+                    {% else %}
+                    <span style="color: #6c757d;">0</span>
+                    {% endif %}
+                </td>
+                <td style="text-align: center;">
+                    {% if vehiculo.conexiones_rco > 0 %}
+                    <strong style="color: #17a2b8;">{{ vehiculo.conexiones_rco }}</strong>
+                    {% else %}
+                    <span style="color: #6c757d;">0</span>
+                    {% endif %}
+                </td>
+                <td style="text-align: center;">
+                    {% if vehiculo.entregas_realizadas > 0 %}
+                    <strong style="color: #28a745;">{{ vehiculo.entregas_realizadas }}</strong>
+                    {% else %}
+                    <span style="color: #6c757d;">0</span>
+                    {% endif %}
+                </td>
+                <td style="font-size: 12px; max-width: 200px;">
+                    {% if vehiculo.destinos %}
+                    <details style="cursor: pointer;">
+                        <summary style="color: #17a2b8; font-weight: 600;">
+                            {{ vehiculo.destinos|length }} destino(s)
+                        </summary>
+                        <div style="margin-top: 8px; padding: 8px; background: #f8f9fa; border-radius: 4px;">
+                            {% for entrega in vehiculo.detalle_entregas %}
+                            <div style="margin-bottom: 6px; padding: 4px; border-left: 3px solid {% if entrega.estado in ['Entregado totalmente', 'Recibí Conforme'] %}#28a745{% else %}#ffc107{% endif %};">
+                                <strong>{{ entrega.destino }}</strong><br>
+                                <small style="color: #6c757d;">{{ entrega.estado }}: {{ entrega.cantidad }}</small>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </details>
+                    {% else %}
+                    <span style="color: #6c757d;">Sin entregas</span>
+                    {% endif %}
+                </td>
+                <td style="text-align: center;">
+                    {% if vehiculo.tiene_actividad %}
+                    <span style="color: #28a745; font-weight: bold;">✓ Activo</span>
+                    {% else %}
+                    <span style="color: #dc3545; font-weight: bold;">✗ Sin actividad</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 20px;">
+        <div style="padding: 15px; background: #f8f9fa; border-radius: 6px; border-left: 4px solid #17a2b8;">
+            <strong style="color: #2c3e50;">Total Vehículos:</strong><br>
+            <span style="color: #17a2b8; font-size: 18px; font-weight: bold;">{{ flota_licitada|length }}</span>
+        </div>
+        <div style="padding: 15px; background: #f8f9fa; border-radius: 6px; border-left: 4px solid #28a745;">
+            <strong style="color: #2c3e50;">Con Actividad:</strong><br>
+            <span style="color: #28a745; font-size: 18px; font-weight: bold;">{{ flota_licitada|selectattr('tiene_actividad')|list|length }}</span>
+        </div>
+        <div style="padding: 15px; background: #f8f9fa; border-radius: 6px; border-left: 4px solid #dc3545;">
+            <strong style="color: #2c3e50;">Sin Actividad:</strong><br>
+            <span style="color: #dc3545; font-size: 18px; font-weight: bold;">{{ (flota_licitada|length) - (flota_licitada|selectattr('tiene_actividad')|list|length) }}</span>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 {% else %}
 <div style="text-align: center; padding: 60px; background: #f8f8f8; border-radius: 8px;">
     <p style="font-size: 18px; color: #666;">
