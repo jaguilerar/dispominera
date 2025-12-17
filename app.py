@@ -151,11 +151,11 @@ def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
     return resultado_completo
 
 
-def calcular_disponibilidad_operacional(datos_completos):
+def calcular_disponibilidad_operacional(datos_completos, banda_total=None):
     """
     Calcular la Disponibilidad Operacional según nueva métrica:
     
-    Disponibilidad = (Entregas Exitosas) / (Total Turnos Enviados)
+    Disponibilidad = (Entregas Exitosas) / (Banda Total del Transportista)
     
     Entregas Exitosas incluyen:
     - Criterio A: Pedido fue entregado correctamente (Entregado_totalmente > 0)
@@ -164,9 +164,11 @@ def calcular_disponibilidad_operacional(datos_completos):
     Definiciones técnicas:
     - "Entregado Correctamente": Estado 'Entregado totalmente' o 'Recibí Conforme' en SCR
     - "Conexiones al RCO": Registro de conexión operacional en tabla RCO (cualquier evento > 0)
+    - "Banda Total": Capacidad asignada al transportista (viajes programados por día)
     
     Args:
         datos_completos: DataFrame con columnas ['Turnos_enviados', 'Entregado_totalmente', 'Conexion_RCO', '¿Es licitado?']
+        banda_total: Banda total del transportista (capacidad asignada). Si es None, se usa turnos_enviados como fallback.
     
     Returns:
         dict con:
@@ -174,6 +176,7 @@ def calcular_disponibilidad_operacional(datos_completos):
             - entregas_criterio_a: Entregas completadas correctamente
             - entregas_criterio_b: Entregas fallidas pero con conexión RCO
             - turnos_enviados_total: Total de turnos enviados
+            - banda_total: Banda total usada en el cálculo
             - disponibilidad_porcentaje: Porcentaje de disponibilidad operacional
             - entregas_licitadas: Total de entregas realizadas por flota licitada
             - entregas_totales: Total de entregas (Entregado_totalmente > 0)
@@ -191,33 +194,48 @@ def calcular_disponibilidad_operacional(datos_completos):
             'disponibilidad_licitada_porcentaje': 0.0
         }
     
+    # DEBUG: Mostrar qué datos se están procesando
+    print(f"DEBUG calcular_disponibilidad_operacional:")
+    print(f"  - Total registros: {len(datos_completos)}")
+    print(f"  - Fechas únicas: {datos_completos['Fecha'].unique() if 'Fecha' in datos_completos.columns else 'N/A'}")
+    print(f"  - Transportistas únicos: {datos_completos['Transportista'].unique() if 'Transportista' in datos_completos.columns else 'N/A'}")
+    print(f"  - Camiones únicos: {datos_completos['Camion'].unique() if 'Camion' in datos_completos.columns else 'N/A'}")
+    
     # Criterio A: Entregado correctamente
     entregas_criterio_a = int(datos_completos['Entregado_totalmente'].sum())
+    print(f"  - Entregas criterio A (sum Entregado_totalmente): {entregas_criterio_a}")
     
     # Criterio B: No entregado PERO con conexión RCO
     # Identificar registros donde NO se entregó (Entregado_totalmente == 0) PERO hubo conexión RCO (Conexion_RCO > 0)
     criterio_b_mask = (datos_completos['Entregado_totalmente'] == 0) & (datos_completos['Conexion_RCO'] > 0)
     entregas_criterio_b = int(criterio_b_mask.sum())
+    print(f"  - Entregas criterio B (count filas con Entregado=0 y RCO>0): {entregas_criterio_b}")
     
     # Total de entregas exitosas (Criterio A ∪ Criterio B)
     entregas_exitosas_total = entregas_criterio_a + entregas_criterio_b
+    print(f"  - Entregas exitosas total: {entregas_exitosas_total}")
     
     # Total de turnos enviados
     turnos_enviados_total = int(datos_completos['Turnos_enviados'].sum())
+    print(f"  - Turnos enviados (sum Turnos_enviados): {turnos_enviados_total}")
+    
+    # Usar banda_total si está disponible, sino usar turnos_enviados como fallback
+    denominador = banda_total if banda_total is not None and banda_total > 0 else turnos_enviados_total
+    print(f"  - Banda total (denominador): {denominador}")
     
     # Calcular porcentaje de disponibilidad operacional
-    if turnos_enviados_total > 0:
-        disponibilidad_porcentaje = (entregas_exitosas_total / turnos_enviados_total) * 100
+    if denominador > 0:
+        disponibilidad_porcentaje = (entregas_exitosas_total / denominador) * 100
     else:
         disponibilidad_porcentaje = 0.0
     
     # Calcular Disponibilidad Licitada
-    # Entregas totales: todas las entregas completadas (Entregado_totalmente > 0)
-    entregas_totales = int((datos_completos['Entregado_totalmente'] > 0).sum())
+    # Entregas totales: suma de todas las entregas completadas
+    entregas_totales = int(datos_completos['Entregado_totalmente'].sum())
     
-    # Entregas licitadas: entregas completadas por flota licitada (¿Es licitado? == 'Si' AND Entregado_totalmente > 0)
+    # Entregas licitadas: suma de entregas completadas por flota licitada
     entregas_licitadas = int(
-        ((datos_completos['¿Es licitado?'] == 'Si') & (datos_completos['Entregado_totalmente'] > 0)).sum()
+        datos_completos[datos_completos['¿Es licitado?'] == 'Si']['Entregado_totalmente'].sum()
     )
     
     # Calcular porcentaje de disponibilidad licitada
@@ -231,10 +249,11 @@ def calcular_disponibilidad_operacional(datos_completos):
         'entregas_criterio_a': entregas_criterio_a,
         'entregas_criterio_b': entregas_criterio_b,
         'turnos_enviados_total': turnos_enviados_total,
-        'disponibilidad_porcentaje': round(disponibilidad_porcentaje, 2),
+        'banda_total': denominador,
+        'disponibilidad_porcentaje': round(disponibilidad_porcentaje, 1),
         'entregas_licitadas': entregas_licitadas,
         'entregas_totales': entregas_totales,
-        'disponibilidad_licitada_porcentaje': round(disponibilidad_licitada_porcentaje, 2)
+        'disponibilidad_licitada_porcentaje': round(disponibilidad_licitada_porcentaje, 1)
     }
 
 
@@ -1042,6 +1061,7 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
                 disponibilidad_banda = 0
             
             # Calcular disponibilidad operacional para este transportista y fecha
+            # Usar la misma función que usa el detalle para consistencia
             disp_op_data = {'porcentaje': 0, 'turnos_enviados': 0, 'entregas_exitosas': 0}
             entregas_licitadas = 0
             entregas_totales = 0
@@ -1052,35 +1072,46 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
                 # Necesitamos comparar con fecha_actual que es date
                 fecha_str_buscar = fecha_actual.strftime('%d-%b')  # Ejemplo: '22-Nov'
                 
+                # DEBUG: Verificar qué fechas hay en datos_completos
+                fechas_disponibles = datos_completos['Fecha'].unique()
+                
                 # Filtrar datos completos por transportista y fecha
                 datos_dia = datos_completos[
                     (datos_completos['Transportista'] == transportista_nombre) &
                     (datos_completos['Fecha'] == fecha_str_buscar)
                 ]
+            
                 
                 if not datos_dia.empty:
-                    # Calcular disponibilidad operacional
-                    turnos_enviados = int(datos_dia['Turnos_enviados'].sum())
-                    entregas_criterio_a = int(datos_dia['Entregado_totalmente'].sum())
-                    entregas_criterio_b = int(((datos_dia['Entregado_totalmente'] == 0) & (datos_dia['Conexion_RCO'] > 0)).sum())
-                    entregas_exitosas = entregas_criterio_a + entregas_criterio_b
+                    for _, row in datos_dia.iterrows():
+                        print(f"  Camión {row['Camion']}: Turnos={row['Turnos_enviados']}, RCO={row['Conexion_RCO']}, Entregado={row['Entregado_totalmente']}, EnRuta={row.get('En_ruta', 0)}, Planificado={row.get('Planificado', 0)}")
                     
-                    if turnos_enviados > 0:
-                        disp_op_porcentaje = (entregas_exitosas / turnos_enviados) * 100
-                    else:
-                        disp_op_porcentaje = 0
+                    # IMPORTANTE: Filtrar solo camiones que tienen actividad SCR ese día
+                    # Solo incluir camiones que tienen entregas, en ruta o planificado > 0
+                    # Excluir camiones que SOLO tienen turnos/RCO pero no actividad SCR
+                    datos_dia_con_actividad = datos_dia[
+                        (datos_dia['Entregado_totalmente'] > 0) |
+                        (datos_dia.get('En_ruta', 0) > 0) |
+                        (datos_dia.get('Planificado', 0) > 0)
+                    ].copy()
                     
-                    disp_op_data = {
-                        'porcentaje': round(disp_op_porcentaje, 1),
-                        'turnos_enviados': turnos_enviados,
-                        'entregas_exitosas': entregas_exitosas,
-                        'entregas_criterio_a': entregas_criterio_a,
-                        'entregas_criterio_b': entregas_criterio_b
-                    }
                     
-                    # Calcular disponibilidad licitada
-                    entregas_totales = int((datos_dia['Entregado_totalmente'] > 0).sum())
-                    entregas_licitadas = int(((datos_dia['¿Es licitado?'] == 'Si') & (datos_dia['Entregado_totalmente'] > 0)).sum())
+                    if not datos_dia_con_actividad.empty:
+                        # Usar la función calcular_disponibilidad_operacional para consistencia con el detalle
+                        # Pasar banda_transportista como parámetro
+                        resultado_disp = calcular_disponibilidad_operacional(datos_dia_con_actividad, banda_transportista)
+                        
+                        disp_op_data = {
+                            'porcentaje': resultado_disp['disponibilidad_porcentaje'],
+                            'turnos_enviados': resultado_disp['turnos_enviados_total'],
+                            'entregas_exitosas': resultado_disp['entregas_exitosas_total'],
+                            'entregas_criterio_a': resultado_disp['entregas_criterio_a'],
+                            'entregas_criterio_b': resultado_disp['entregas_criterio_b']
+                        }
+                        
+                        # Obtener datos de disponibilidad licitada desde la misma función
+                        entregas_licitadas = resultado_disp['entregas_licitadas']
+                        entregas_totales = resultado_disp['entregas_totales']
 
             matriz_data['datos'][transportista_nombre][fecha_str] = {
                 'porcentaje': round(disponibilidad_banda, 1),
@@ -1088,7 +1119,7 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
                 'banda': banda_transportista,
                 'cumplidos': viajes_realizados,
                 'transportista_id': 0,
-                'fecha_full': row['Fecha'].strftime('%Y-%m-%d'),
+                'fecha_full': row['Fecha'].strftime('%Y-%m-%d') if hasattr(row['Fecha'], 'strftime') else fecha_actual.strftime('%Y-%m-%d'),
                 'disponibilidad_operacional': disp_op_data,
                 'entregas_licitadas': entregas_licitadas,
                 'entregas_totales': entregas_totales
@@ -1100,7 +1131,8 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
         matriz_data['datos']['OTRO TRANSPORTISTA'] = {}
         
         for _, row in resumen_diario.iterrows():
-            fecha_str = row['Fecha'].strftime('%d-%m')
+            fecha_str = row['Fecha'].strftime('%d-%m') if hasattr(row['Fecha'], 'strftime') else row['Fecha']
+            fecha_actual = row['Fecha'].date() if hasattr(row['Fecha'], 'date') else row['Fecha']
             datos_otros = otros_transportistas_data[otros_transportistas_data['Fecha'] == row['Fecha']]
             entregas_realizadas = int(datos_otros['Entregado totalmente'].sum())
             
@@ -1111,7 +1143,7 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
                 'banda': None,  # Sin banda asignada
                 'cumplidos': entregas_realizadas,
                 'transportista_id': 0,
-                'fecha_full': row['Fecha'].strftime('%Y-%m-%d'),
+                'fecha_full': row['Fecha'].strftime('%Y-%m-%d') if hasattr(row['Fecha'], 'strftime') else str(row['Fecha']),
                 'es_otro': True,  # Marca especial para el frontend
                 'disponibilidad_operacional': {'porcentaje': 0, 'turnos_enviados': 0, 'entregas_exitosas': 0},
                 'entregas_licitadas': 0,
@@ -1180,7 +1212,7 @@ def detalle():
                 for transportista in datos_completos['Transportista'].unique():
                     if not es_transportista_autorizado(transportista, minera_nombre):
                         transportistas_no_autorizados.append(transportista)
-                
+                                
                 datos_completos_filtrados = datos_completos[
                     datos_completos['Transportista'].isin(transportistas_no_autorizados)
                 ]
@@ -1193,7 +1225,7 @@ def detalle():
                     ]
                     registros = df_scr_filtrado.to_dict('records')
             else:
-                # Caso normal: filtrar por transportista específico
+                # Caso normal: filtrar por transportista específico   
                 if transportista_nombre:
                     datos_completos_filtrados = datos_completos[datos_completos['Transportista'] == transportista_nombre]
                 else:
@@ -1227,7 +1259,7 @@ def detalle():
                             banda_total += banda
                 
                 # Calcular disponibilidad operacional según nueva métrica
-                disponibilidad_operacional = calcular_disponibilidad_operacional(datos_completos_filtrados)
+                disponibilidad_operacional = calcular_disponibilidad_operacional(datos_completos_filtrados, banda_total)
                 
                 banda_info = {
                     'banda_total': banda_total,

@@ -74,7 +74,7 @@
         
         {% if banda_info and banda_info.get('es_otro_transportista') %}
         <div style="background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
-            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Disponibilidad Por Banda</h3>
+            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Cumplimiento Por Banda</h3>
             <p style="margin: 0; font-size: 64px; font-weight: bold; line-height: 1; color: #6c757d;">
                 N/A
             </p>
@@ -84,7 +84,7 @@
         {% set banda_total = banda_info.banda_total %}
         {% set porcentaje = (entregados / banda_total * 100)|round|int %}
         <div style="background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
-            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Disponibilidad Por Banda</h3>
+            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Cumplimiento Por Banda</h3>
             <p style="margin: 0; font-size: 64px; font-weight: bold; line-height: 1; color: {% if porcentaje >= 85 %}#28a745{% else %}#dc3545{% endif %};">
                 {{ porcentaje }}%
             </p>
@@ -92,7 +92,7 @@
         
         {% else %}
         <div style="background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
-            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Disponibilidad Por Banda</h3>
+            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Cumplimiento Por Banda</h3>
             <p style="margin: 0; font-size: 64px; font-weight: bold; line-height: 1; color: #6c757d;">
                 N/A
             </p>
@@ -103,7 +103,7 @@
         {% if banda_info and banda_info.disponibilidad_operacional %}
         {% set disp_op = banda_info.disponibilidad_operacional %}
         <div style="background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
-            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Disponibilidad Licitada</h3>
+            <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Entregas por Flota Licitada</h3>
             <p style="margin: 0; font-size: 64px; font-weight: bold; line-height: 1; color: {% if disp_op.disponibilidad_licitada_porcentaje >= 85 %}#28a745{% else %}#dc3545{% endif %};">
                 {{ disp_op.disponibilidad_licitada_porcentaje }}%
             </p>
@@ -121,13 +121,14 @@
         <div style="background: #f8f9fa; border-radius: 8px; padding: 20px; border-left: 4px solid {% if disp_op.disponibilidad_porcentaje >= 85 %}#28a745{% else %}#dc3545{% endif %};">
             <div style="font-size: 14px; font-weight: 600; margin-bottom: 10px; color: #2c3e50;">📐 Fórmula:</div>
             <div style="font-size: 13px; color: #495057; margin-bottom: 12px; font-family: 'Courier New', monospace; background: white; padding: 8px; border-radius: 4px;">
-                (Entregas Exitosas / Total Turnos) × 100
+                (Entregas Exitosas / Banda Total) × 100
             </div>
             <div style="font-size: 12px; color: #6c757d; line-height: 1.6;">
                 <strong>Entregas Exitosas:</strong> {{ disp_op.entregas_exitosas_total }}<br>
                 <small style="padding-left: 10px;">• Entregadas: {{ disp_op.entregas_criterio_a }}</small><br>
                 <small style="padding-left: 10px;">• Con RCO: {{ disp_op.entregas_criterio_b }}</small><br>
-                <strong>Total Turnos:</strong> {{ disp_op.turnos_enviados_total }}
+                <strong>Banda Total:</strong> {{ disp_op.banda_total if disp_op.banda_total else disp_op.turnos_enviados_total }}<br>
+                <small style="color: #95a5a6;">(Turnos enviados: {{ disp_op.turnos_enviados_total }})</small>
             </div>
             <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #dee2e6; font-size: 11px; color: #6c757d;">
                 <strong>Criterios:</strong> A) Entregado correctamente | B) No entregado pero con conexión RCO

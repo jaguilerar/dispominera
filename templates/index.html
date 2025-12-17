@@ -526,7 +526,7 @@ function updateMatrix(matrizData, minera) {
         
         matrizData.fechas.forEach(fecha => {
             const celda = matrizData.datos[transportista][fecha];
-            
+
             // Verificar si es "OTRO TRANSPORTISTA"
             if (transportista === 'OTRO TRANSPORTISTA' || celda.es_otro) {
                 // Para "OTRO TRANSPORTISTA", mostrar solo las entregas sin color ni porcentaje
@@ -587,11 +587,11 @@ function updateMatrix(matrizData, minera) {
                                     <div class="tooltip-metric-value" style="color: ${colorDispOp};">${dispOperacional.toFixed(1)}%</div>
                                 </div>
                                 <div class="tooltip-metric">
-                                    <div class="tooltip-metric-label">Disp. Por Banda</div>
+                                    <div class="tooltip-metric-label">Cumpl. Por Banda</div>
                                     <div class="tooltip-metric-value" style="color: ${colorDispBanda};">${dispBanda}%</div>
                                 </div>
                                 <div class="tooltip-metric">
-                                    <div class="tooltip-metric-label">Disp. Licitada</div>
+                                    <div class="tooltip-metric-label">Entreg. por Flota Licitada</div>
                                     <div class="tooltip-metric-value" style="color: ${colorDispLic};">${dispLicitadaPct}%</div>
                                 </div>
                             </div>
