@@ -127,11 +127,16 @@
                 <strong>Entregas Exitosas:</strong> {{ disp_op.entregas_exitosas_total }}<br>
                 <small style="padding-left: 10px;">• Entregadas: {{ disp_op.entregas_criterio_a }}</small><br>
                 <small style="padding-left: 10px;">• Con RCO: {{ disp_op.entregas_criterio_b }}</small><br>
+                <small style="padding-left: 10px; color: #ffc107;">• Con eventos GPS: <strong>0</strong> <span style="background: #fff3cd; padding: 1px 6px; border-radius: 4px; font-size: 10px;">⚙️ Próximamente</span></small><br>
                 <strong>Banda Total:</strong> {{ disp_op.banda_total if disp_op.banda_total else disp_op.turnos_enviados_total }}<br>
                 <small style="color: #95a5a6;">(Turnos enviados: {{ disp_op.turnos_enviados_total }})</small>
             </div>
             <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #dee2e6; font-size: 11px; color: #6c757d;">
-                <strong>Criterios:</strong> A) Entregado correctamente | B) No entregado pero con conexión RCO
+                <strong>Criterios:</strong> A) Entregado correctamente | B) No entregado pero con conexión RCO | <span style="color: #ffc107;">C) Eventos GPS validados (en desarrollo)</span>
+            </div>
+            <div style="margin-top: 8px; padding: 8px; background: #fff3cd; border-left: 3px solid #ffc107; border-radius: 4px; font-size: 11px;">
+                <strong style="color: #856404;">🚧 Mejora en desarrollo:</strong>
+                <span style="color: #856404;">Se está implementando la validación de eventos GPS para complementar el cálculo de disponibilidad operacional.</span>
             </div>
         </div>
         {% endif %}
