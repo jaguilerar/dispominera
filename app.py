@@ -1,11 +1,14 @@
 from flask import Flask, render_template, request, jsonify
 from flask_httpauth import HTTPBasicAuth
+from flask_caching import Cache
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import os
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
+import hashlib
+import json
 
 load_dotenv()
 
@@ -20,6 +23,49 @@ except ImportError:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', '')
+
+# ============================================
+# CONFIGURACIÓN DE CACHÉ
+# ============================================
+# Configurar cache - usar SimpleCache para desarrollo, Redis para producción
+cache_config = {
+    'CACHE_TYPE': os.getenv('CACHE_TYPE', 'SimpleCache'),  # 'SimpleCache' o 'RedisCache'
+    'CACHE_DEFAULT_TIMEOUT': int(os.getenv('CACHE_TIMEOUT', '900')),  # 15 minutos por defecto
+}
+
+# Si se usa Redis, agregar configuración
+if cache_config['CACHE_TYPE'] == 'RedisCache':
+    cache_config.update({
+        'CACHE_REDIS_URL': os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+    })
+
+app.config.update(cache_config)
+cache = Cache(app)
+
+print(f"📦 Caché configurado: {cache_config['CACHE_TYPE']} (timeout: {cache_config['CACHE_DEFAULT_TIMEOUT']}s)")
+
+# ============================================
+# MIDDLEWARE PARA MEDICIÓN DE TIEMPOS
+# ============================================
+@app.before_request
+def before_request():
+    """Registrar tiempo de inicio de request"""
+    from flask import g
+    import time
+    g.start_time = time.time()
+
+@app.after_request
+def after_request(response):
+    """Registrar tiempo de respuesta"""
+    from flask import g, request
+    import time
+    
+    if hasattr(g, 'start_time'):
+        elapsed = time.time() - g.start_time
+        if request.path.startswith('/api/'):
+            print(f"⏱️  {request.method} {request.path} - {elapsed:.2f}s")
+    
+    return response
 
 # ============================================
 # CONFIGURACIÓN DE AUTENTICACIÓN
@@ -70,6 +116,28 @@ USE_ATHENA = os.getenv('USE_ATHENA', 'true').lower() == 'true' and ATHENA_AVAILA
 # Conexión global a Athena
 athena_conn = None
 
+# ============================================
+# FUNCIONES HELPER PARA CACHÉ
+# ============================================
+def generar_cache_key(prefix, *args, **kwargs):
+    """Generar clave única para cache basada en parámetros"""
+    # Crear string único con todos los parámetros
+    key_data = f"{prefix}_{args}_{sorted(kwargs.items())}"
+    # Hash para mantener claves cortas
+    key_hash = hashlib.md5(key_data.encode()).hexdigest()[:12]
+    return f"{prefix}_{key_hash}"
+
+def invalidar_cache_minera(minera_nombre):
+    """Invalidar todo el cache relacionado con una minera específica"""
+    # Flask-Caching no tiene invalidación por patrón en SimpleCache
+    # Esta función es un placeholder para cuando se use Redis
+    cache.clear()
+    print(f"🗑️ Cache invalidado para minera: {minera_nombre}")
+
+# ============================================
+# FIN FUNCIONES HELPER PARA CACHÉ
+# ============================================
+
 def get_athena_connection():
     """Obtener o crear conexión a Athena"""
     global athena_conn
@@ -100,10 +168,14 @@ def sql_athena(query):
         return pd.DataFrame()
 
 
+@cache.memoize(timeout=900)  # Cache por 15 minutos
 def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
     """
     Obtener datos completos integrando SCR, Turnos y RCO (similar al notebook)
+    NOTA: Esta función está cacheada por 15 minutos (hace 3 queries grandes)
     """
+    print(f"🔄 [CACHE MISS] Ejecutando 3 queries completas para {minera_nombre} ({fecha_inicio} - {fecha_fin})")
+    
     if not USE_ATHENA:
         return None
 
@@ -113,8 +185,14 @@ def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
         return None
 
     # 2. Obtener turnos enviados
+    # OPTIMIZACIÓN: Seleccionar solo columnas necesarias y filtrar en query
     query_turnos = f"""
-    SELECT * 
+    SELECT 
+        id_turno_uuid,
+        estado,
+        id_vehiculo,
+        fecha_inicio_utc,
+        fecha_hora
     FROM {DATABASE_DISPOMATE}.{TABLA_TURNOS}
     WHERE DATE(fecha_inicio_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
       AND DATE(fecha_inicio_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
@@ -128,8 +206,11 @@ def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
         df_turnos = pd.DataFrame()
 
     # 3. Obtener conexiones RCO
+    # OPTIMIZACIÓN: Seleccionar solo columnas necesarias
     query_rco = f"""
-    SELECT * 
+    SELECT 
+        codigo_tanque,
+        fecha_conexion_utc
     FROM {DATABASE_DISPOMATE}.{TABLA_RCO}
     WHERE DATE(fecha_conexion_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
       AND DATE(fecha_conexion_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
@@ -191,38 +272,29 @@ def calcular_disponibilidad_operacional(datos_completos, banda_total=None):
             'disponibilidad_licitada_porcentaje': 0.0
         }
     
-    # DEBUG: Mostrar qué datos se están procesando
-    print(f"DEBUG calcular_disponibilidad_operacional:")
-    print(f"  - Total registros: {len(datos_completos)}")
-    print(f"  - Fechas únicas: {datos_completos['Fecha'].unique() if 'Fecha' in datos_completos.columns else 'N/A'}")
-    print(f"  - Transportistas únicos: {datos_completos['Transportista'].unique() if 'Transportista' in datos_completos.columns else 'N/A'}")
-    print(f"  - Camiones únicos: {datos_completos['Camion'].unique() if 'Camion' in datos_completos.columns else 'N/A'}")
-    
     # Criterio A: Entregado correctamente
     entregas_criterio_a = int(datos_completos['Entregado_totalmente'].sum())
-    print(f"  - Entregas criterio A (sum Entregado_totalmente): {entregas_criterio_a}")
     
     # Criterio B: No entregado PERO con conexión RCO
+    # IMPORTANTE: Contar solo 1 por registro si hubo RCO (no sumar todas las conexiones)
     # Identificar registros donde NO se entregó (Entregado_totalmente == 0) PERO hubo conexión RCO (Conexion_RCO > 0)
     criterio_b_mask = (datos_completos['Entregado_totalmente'] == 0) & (datos_completos['Conexion_RCO'] > 0)
-    entregas_criterio_b = int(criterio_b_mask.sum())
-    print(f"  - Entregas criterio B (count filas con Entregado=0 y RCO>0): {entregas_criterio_b}")
+    entregas_criterio_b = int(criterio_b_mask.sum())  # Cuenta 1 por cada registro que cumple la condición
     
     # Total de entregas exitosas (Criterio A ∪ Criterio B)
     entregas_exitosas_total = entregas_criterio_a + entregas_criterio_b
-    print(f"  - Entregas exitosas total: {entregas_exitosas_total}")
     
     # Total de turnos enviados
     turnos_enviados_total = int(datos_completos['Turnos_enviados'].sum())
-    print(f"  - Turnos enviados (sum Turnos_enviados): {turnos_enviados_total}")
     
     # Usar banda_total si está disponible, sino usar turnos_enviados como fallback
     denominador = banda_total if banda_total is not None and banda_total > 0 else turnos_enviados_total
-    print(f"  - Banda total (denominador): {denominador}")
     
     # Calcular porcentaje de disponibilidad operacional
     if denominador > 0:
         disponibilidad_porcentaje = (entregas_exitosas_total / denominador) * 100
+        # IMPORTANTE: Limitar a 100% máximo
+        disponibilidad_porcentaje = min(disponibilidad_porcentaje, 100.0)
     else:
         disponibilidad_porcentaje = 0.0
     
@@ -254,9 +326,11 @@ def calcular_disponibilidad_operacional(datos_completos, banda_total=None):
     }
 
 
+@cache.memoize(timeout=900)  # Cache por 15 minutos
 def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin, minera_nombre=None):
     """
     Procesar y combinar datos de SCR, Turnos y RCO (replicando lógica del notebook)
+    NOTA: Función cacheada para evitar reprocesamiento costoso
     
     Args:
         df_scr: DataFrame con datos SCR
@@ -266,20 +340,15 @@ def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin,
         fecha_fin: Fecha final del rango
         minera_nombre: Nombre de la minera (opcional, para obtener flota licitada)
     """
+    print(f"🔄 [CACHE MISS] Procesando datos completos para {minera_nombre}")
     # Obtener vehículos únicos del SCR - filtrar solo valores numéricos válidos
-    vehiculos_totales = df_scr['vehiclereal'].dropna().unique()
+    # OPTIMIZACIÓN: Usar operaciones vectorizadas en lugar de loops
+    vehiculos_totales = df_scr['vehiclereal'].dropna()
     
-    # Filtrar solo valores que sean convertibles a int
-    vehiculos_validos = []
-    for veh in vehiculos_totales:
-        try:
-            veh_int = int(float(veh))
-            if veh_int > 0:  # Solo vehículos con ID positivo
-                vehiculos_validos.append(veh_int)
-        except (ValueError, TypeError):
-            continue
-    
-    vehiculos_totales = np.sort(np.array(vehiculos_validos))
+    # Convertir a numérico de una vez (más rápido que loop)
+    vehiculos_numericos = pd.to_numeric(vehiculos_totales, errors='coerce')
+    vehiculos_validos = vehiculos_numericos[vehiculos_numericos > 0].astype(int).unique()
+    vehiculos_totales = np.sort(vehiculos_validos)
     
     # Obtener vehículos licitados desde la tabla de flota o usar lista por defecto
     if minera_nombre:
@@ -289,27 +358,26 @@ def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin,
         vehiculos_licitados = [4002, 4003, 4049, 8054, 8120, 8348, 8820]
     
     # Crear tabla base combinando todos los vehículos con todas las fechas
+    # OPTIMIZACIÓN: Usar producto cartesiano de pandas en lugar de loops
     fechas_rango = pd.date_range(start=fecha_inicio, end=fecha_fin, freq='D')
     
-    base_data = []
-    for vehiculo in vehiculos_totales:
-        for fecha in fechas_rango:
-            base_data.append({
-                'Camion': int(vehiculo),
-                'Fecha': fecha.strftime('%d-%b'),
-                'fecha_completa': fecha,
-                'fecha_para_merge': fecha.date()
-            })
+    # Crear MultiIndex y convertir a DataFrame (más eficiente)
+    import itertools
+    indices = list(itertools.product(vehiculos_totales, fechas_rango))
     
-    tabla_base = pd.DataFrame(base_data)
+    tabla_base = pd.DataFrame(indices, columns=['Camion', 'fecha_completa'])
+    tabla_base['Fecha'] = tabla_base['fecha_completa'].dt.strftime('%d-%b')
+    tabla_base['fecha_para_merge'] = tabla_base['fecha_completa'].dt.date
+    tabla_base['Camion'] = tabla_base['Camion'].astype(int)
     tabla_base['¿Es licitado?'] = np.where(tabla_base['Camion'].isin(vehiculos_licitados), 'Si', 'No')
     
     # Procesar turnos enviados
     if not df_turnos.empty:
+        # OPTIMIZACIÓN: Usar set_index para merges más rápidos
         # Obtener estado final por turno
         estado_final = (
             df_turnos.sort_values(['id_turno_uuid', 'fecha_hora'])
-                     .groupby('id_turno_uuid')
+                     .groupby('id_turno_uuid', as_index=False)
                      .tail(1)[['id_turno_uuid', 'estado', 'id_vehiculo', 'fecha_inicio_utc']]
         )
         
@@ -406,7 +474,8 @@ def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin,
         .drop_duplicates(subset=['vehiclereal', 'fecha_corregida'])
         .groupby(['vehiclereal', 'fecha_corregida'], as_index=False).first()
     )
-    carriers['vehiclereal'] = carriers['vehiclereal'].astype(int)
+    # Convertir vehiclereal a int (manejar strings con decimales)
+    carriers['vehiclereal'] = pd.to_numeric(carriers['vehiclereal'], errors='coerce').fillna(0).astype(int)
     
     # Crear fecha para merge
     tabla_base['fecha_merge_scr'] = pd.to_datetime(tabla_base['Fecha'] + '-2025', format='%d-%b-%Y').dt.strftime('%Y-%m-%d')
@@ -458,10 +527,14 @@ def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin,
 
 
 # Funciones para obtener datos desde Athena
+@cache.memoize(timeout=900)  # Cache por 15 minutos (datos cambian poco)
 def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
     """
     Obtener datos desde Athena siguiendo la lógica de athena_test.py
+    NOTA: Esta función está cacheada por 15 minutos para reducir queries costosas
     """
+    print(f"🔄 [CACHE MISS] Ejecutando query SCR para {minera_nombre} ({fecha_inicio} - {fecha_fin})")
+    
     if not USE_ATHENA:
         return None
 
@@ -474,22 +547,38 @@ def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
             minera_safe = minera.replace("'", "''")
             conditions.append(f"vtext LIKE '{minera_safe}'")
         
+        # OPTIMIZACIÓN: Seleccionar solo columnas necesarias
         query = f"""
-        SELECT *
+        SELECT 
+            vdatu,
+            vtext,
+            vehiclereal,
+            carriername1,
+            descrstatu
         FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
         WHERE vdatu >= '{fecha_inicio.strftime('%Y-%m-%d')}'
           AND vdatu <= '{fecha_fin.strftime('%Y-%m-%d')}'
           AND ({' OR '.join(conditions)})
+          AND carriername1 IS NOT NULL
+          AND carriername1 != 'SIN_INFORMACION'
         """
     else:
         # Caso normal para mineras individuales
         minera_safe = minera_nombre.replace("'", "''")
+        # OPTIMIZACIÓN: Seleccionar solo columnas necesarias
         query = f"""
-        SELECT *
+        SELECT 
+            vdatu,
+            vtext,
+            vehiclereal,
+            carriername1,
+            descrstatu
         FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
         WHERE vdatu >= '{fecha_inicio.strftime('%Y-%m-%d')}'
           AND vdatu <= '{fecha_fin.strftime('%Y-%m-%d')}'
           AND vtext LIKE '{minera_safe}'
+          AND carriername1 IS NOT NULL
+          AND carriername1 != 'SIN_INFORMACION'
         """
 
     try:
@@ -546,6 +635,7 @@ def procesar_datos_athena(df, minimo_viajes, maximo_viajes):
     return tabla_base, resumen_diario
 
 
+@cache.cached(timeout=3600, key_prefix='mineras_athena')  # Cache por 1 hora
 def obtener_mineras_athena():
     """Obtener lista de mineras predefinidas"""
     # Lista fija de mineras requeridas
@@ -563,6 +653,7 @@ def obtener_mineras_athena():
     return mineras_predefinidas
 
 
+@cache.cached(timeout=3600, key_prefix='mineras_codelco')  # Cache por 1 hora
 def obtener_mineras_codelco():
     """Obtener lista de mineras que forman parte de CODELCO"""
     return ['MINISTRO HALES', 'RADOMIRO TOMIC', 'CHUQUICAMATA', 'MINA GABY']
@@ -595,6 +686,7 @@ def obtener_mapeo_uso_mineras():
     return mapeo_uso
 
 
+@cache.memoize(timeout=600)  # Cache por 10 minutos con parámetros
 def obtener_flota_licitada_athena(minera_nombre):
     """
     Obtener vehículos de flota licitada desde Athena para una minera específica
@@ -831,6 +923,7 @@ def obtener_actividad_flota_licitada(minera_nombre, fecha_inicio, fecha_fin):
     return actividad_flota
 
 
+@cache.cached(timeout=3600, key_prefix='config_viajes')  # Cache por 1 hora
 def obtener_configuracion_viajes():
     """Obtener configuración de bandas mínimas y máximas de viajes por minera"""
     configuracion_viajes = {
@@ -847,6 +940,7 @@ def obtener_configuracion_viajes():
     return configuracion_viajes
 
 
+@cache.cached(timeout=3600, key_prefix='config_bandas')  # Cache por 1 hora
 def obtener_configuracion_bandas_transportista():
     """Obtener configuración de bandas de capacidad por transportista"""
     # Banda estándar por transportista (viajes por día)
@@ -948,7 +1042,10 @@ def obtener_transportistas_athena(minera_nombre, fecha_inicio, fecha_fin):
     return [t for t in transportistas if t != 'SIN_INFORMACION']
 
 
+@cache.memoize(timeout=900)  # Cache por 15 minutos
 def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max):
+    """Obtener datos para gráfico con cache"""
+    print(f"🔄 [CACHE MISS] Generando datos de gráfico para {minera_nombre}")
     df = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
     if df is None or df.empty:
         return {'datos': [], 'minimo': viajes_min, 'maximo': viajes_max, 'tipo': 'apilado', 'transportistas': []}
@@ -1017,7 +1114,10 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
     return grafico_data
 
 
+@cache.memoize(timeout=900)  # Cache por 15 minutos
 def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max):
+    """Obtener datos para matriz con cache"""
+    print(f"🔄 [CACHE MISS] Generando matriz de datos para {minera_nombre}")
     df = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
     if df is None or df.empty:
         return {'transportistas': [], 'fechas': [], 'datos': {}}
@@ -1085,20 +1185,13 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
                 # Necesitamos comparar con fecha_actual que es date
                 fecha_str_buscar = fecha_actual.strftime('%d-%b')  # Ejemplo: '22-Nov'
                 
-                # DEBUG: Verificar qué fechas hay en datos_completos
-                fechas_disponibles = datos_completos['Fecha'].unique()
-                
                 # Filtrar datos completos por transportista y fecha
                 datos_dia = datos_completos[
                     (datos_completos['Transportista'] == transportista_nombre) &
                     (datos_completos['Fecha'] == fecha_str_buscar)
                 ]
-            
                 
                 if not datos_dia.empty:
-                    for _, row in datos_dia.iterrows():
-                        print(f"  Camión {row['Camion']}: Turnos={row['Turnos_enviados']}, RCO={row['Conexion_RCO']}, Entregado={row['Entregado_totalmente']}, EnRuta={row.get('En_ruta', 0)}, Planificado={row.get('Planificado', 0)}")
-                    
                     # IMPORTANTE: Filtrar solo camiones que tienen actividad SCR ese día
                     # Solo incluir camiones que tienen entregas, en ruta o planificado > 0
                     # Excluir camiones que SOLO tienen turnos/RCO pero no actividad SCR
@@ -1166,11 +1259,19 @@ def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_m
     return matriz_data
 
 
+@cache.cached(timeout=1800, key_prefix='transportistas_global')  # Cache por 30 minutos
 def obtener_transportistas_global():
     """Obtener transportistas únicos de la tabla completa (para administración)."""
     if not USE_ATHENA:
         return []
-    query = f"SELECT DISTINCT carriername1 as transportista FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS} WHERE carriername1 IS NOT NULL ORDER BY transportista"
+    # OPTIMIZACIÓN: Agregar límite y filtro de SIN_INFORMACION en query
+    query = f"""
+    SELECT DISTINCT carriername1 as transportista 
+    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS} 
+    WHERE carriername1 IS NOT NULL 
+      AND carriername1 != 'SIN_INFORMACION'
+    ORDER BY transportista
+    """
     try:
         df = sql_athena(query)
         if df.empty:
@@ -1455,6 +1556,44 @@ def debug_transportistas():
         
     except Exception as e:
         return jsonify({'error': f'Error obteniendo transportistas: {str(e)}'}), 500
+
+
+@app.route('/api/cache/clear', methods=['POST'])
+@auth.login_required
+def clear_cache():
+    """Endpoint para limpiar el cache manualmente"""
+    try:
+        cache.clear()
+        return jsonify({
+            'success': True,
+            'mensaje': 'Cache limpiado exitosamente'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/cache/stats', methods=['GET'])
+@auth.login_required
+def cache_stats():
+    """Obtener estadísticas del cache (solo disponible con algunos backends)"""
+    stats = {
+        'cache_type': app.config['CACHE_TYPE'],
+        'default_timeout': app.config['CACHE_DEFAULT_TIMEOUT'],
+        'mensaje': 'Para estadísticas detalladas, use Redis como backend'
+    }
+    
+    # Intentar obtener info adicional si es posible
+    try:
+        if hasattr(cache.cache, '_cache'):
+            stats['cached_keys_count'] = len(cache.cache._cache)
+            stats['cached_keys'] = list(cache.cache._cache.keys())[:10]  # Primeras 10
+    except:
+        pass
+    
+    return jsonify(stats)
 
 
 @app.route('/api/mineras', methods=['GET', 'POST'])

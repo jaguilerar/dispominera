@@ -5,6 +5,7 @@ wheel>=0.41
 Flask==3.0.0
 Flask-SQLAlchemy==3.1.1
 Flask-HTTPAuth==4.8.0
+Flask-Caching==2.1.0
 SQLAlchemy==2.0.23
 pandas==2.1.3
 numpy==1.26.2
@@ -12,3 +13,6 @@ pyarrow==14.0.1
 fastparquet==2023.10.1
 PyAthena==3.4.0
 python-dotenv==1.0.0
+
+# Opcional: Para cache con Redis (mejor rendimiento en producción)
+# redis==5.0.1
