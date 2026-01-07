@@ -100,9 +100,6 @@ def sql_athena(query):
         return pd.DataFrame()
 
 
-# NOTE: Removing SQLAlchemy models — the app now works exclusively with Athena.
-
-
 def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
     """
     Obtener datos completos integrando SCR, Turnos y RCO (similar al notebook)
@@ -269,9 +266,20 @@ def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin,
         fecha_fin: Fecha final del rango
         minera_nombre: Nombre de la minera (opcional, para obtener flota licitada)
     """
-    # Obtener vehículos únicos del SCR
+    # Obtener vehículos únicos del SCR - filtrar solo valores numéricos válidos
     vehiculos_totales = df_scr['vehiclereal'].dropna().unique()
-    vehiculos_totales = np.sort(vehiculos_totales.astype(int))
+    
+    # Filtrar solo valores que sean convertibles a int
+    vehiculos_validos = []
+    for veh in vehiculos_totales:
+        try:
+            veh_int = int(float(veh))
+            if veh_int > 0:  # Solo vehículos con ID positivo
+                vehiculos_validos.append(veh_int)
+        except (ValueError, TypeError):
+            continue
+    
+    vehiculos_totales = np.sort(np.array(vehiculos_validos))
     
     # Obtener vehículos licitados desde la tabla de flota o usar lista por defecto
     if minera_nombre:
@@ -388,7 +396,8 @@ def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin,
         if estado not in pivot_scr.columns:
             pivot_scr[estado] = 0
     
-    pivot_scr['vehiclereal'] = pivot_scr['vehiclereal'].astype(int)
+    # Convertir vehiclereal a int (manejar strings con decimales)
+    pivot_scr['vehiclereal'] = pd.to_numeric(pivot_scr['vehiclereal'], errors='coerce').fillna(0).astype(int)
     
     # Obtener transportista por vehículo y fecha
     carriers = (
@@ -639,6 +648,10 @@ def obtener_flota_licitada_athena(minera_nombre):
         
         # Convertir codigo_tanque a int
         df_flota['codigo_tanque'] = df_flota['codigo_tanque'].astype(int)
+        
+        # Eliminar duplicados - mantener solo un registro por vehículo
+        # Priorizar el primer registro encontrado
+        df_flota = df_flota.drop_duplicates(subset=['codigo_tanque'], keep='first')
         
         return df_flota
     except Exception as e:

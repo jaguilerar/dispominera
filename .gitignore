@@ -9,6 +9,8 @@
 /athena_test.py
 /test_codelco.py
 /dispominera.ipynb
+/kpi_mensual.py
+/KPIs_LOS_BRONCES_2025-12.xlsx
 
 # Archivos de Python adicionales
 *.py[cod]
@@ -32,3 +34,4 @@ eggs/
 # OS generated files
 .DS_Store
 Thumbs.db
+
