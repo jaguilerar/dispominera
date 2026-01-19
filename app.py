@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_file
 from flask_httpauth import HTTPBasicAuth
 from flask_caching import Cache
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -9,6 +9,11 @@ import numpy as np
 from dotenv import load_dotenv
 import hashlib
 import json
+import itertools
+from io import BytesIO
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 load_dotenv()
 
@@ -477,8 +482,8 @@ def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin,
     # Convertir vehiclereal a int (manejar strings con decimales)
     carriers['vehiclereal'] = pd.to_numeric(carriers['vehiclereal'], errors='coerce').fillna(0).astype(int)
     
-    # Crear fecha para merge
-    tabla_base['fecha_merge_scr'] = pd.to_datetime(tabla_base['Fecha'] + '-2025', format='%d-%b-%Y').dt.strftime('%Y-%m-%d')
+    # Crear fecha para merge - usar el año de fecha_completa en lugar de hardcodear
+    tabla_base['fecha_merge_scr'] = tabla_base['fecha_completa'].dt.strftime('%Y-%m-%d')
     
     # Merge con datos SCR
     tabla_final = tabla_base.merge(
@@ -689,15 +694,208 @@ def obtener_mapeo_uso_mineras():
 @cache.memoize(timeout=600)  # Cache por 10 minutos con parámetros
 def obtener_flota_licitada_athena(minera_nombre):
     """
-    Obtener vehículos de flota licitada desde Athena para una minera específica
+    Obtener vehículos de flota licitada desde Excel local o Athena (fallback)
+    
+    Prioridad:
+    1. Excel local (Flota 20260108.xlsx) - NO se sube a Git
+    2. Athena (fallback si no existe el Excel)
     
     Args:
         minera_nombre: Nombre de la minera (según nomenclatura de la app)
     
     Returns:
-        DataFrame con columnas: codigo_tanque, nombre_transportista, estado, uso
+        DataFrame con columnas: codigo_tanque, nombre_transportista, uso
         o DataFrame vacío si no hay datos o hay error
     """
+    # PRIORIDAD 1: Intentar leer desde archivo TXT tabular
+    # Buscar en múltiples ubicaciones (Render Secret Files + local)
+    rutas_txt_posibles = [
+        '/etc/secrets/mantenedor_flota.txt',  # Render Secret Files (ubicación alternativa)
+        os.path.join(os.path.dirname(__file__), 'mantenedor_flota.txt'),  # Raíz de la app (Render o local)
+        os.path.join(os.path.dirname(__file__), 'Flota_20260108 - copia.txt')  # Nombre alternativo local
+    ]
+    
+    ruta_txt = None
+    for ruta in rutas_txt_posibles:
+        if os.path.exists(ruta):
+            ruta_txt = ruta
+            break
+    
+    if ruta_txt:
+        try:
+            print(f"\n{'='*80}")
+            print(f"📄 LEYENDO FLOTA DESDE TXT LOCAL")
+            print(f"   Ruta: {ruta_txt}")
+            print(f"   Minera solicitada: {minera_nombre}")
+            
+            # Intentar múltiples codificaciones
+            encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+            df_txt = None
+            encoding_used = None
+            
+            for encoding in encodings:
+                try:
+                    df_txt = pd.read_csv(ruta_txt, sep='\t', encoding=encoding)
+                    encoding_used = encoding
+                    print(f"   ✓ TXT cargado exitosamente con codificación: {encoding}")
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            
+            if df_txt is None:
+                raise Exception(f"No se pudo decodificar el archivo con ninguna codificación: {encodings}")
+            
+            print(f"   ✓ Total de registros en TXT: {len(df_txt)}")
+            print(f"   ✓ Columnas encontradas: {list(df_txt.columns)}")
+            
+            # Validar columnas requeridas
+            columnas_requeridas = ['Equipo', 'Transportista', 'Uso']
+            if all(col in df_txt.columns for col in columnas_requeridas):
+                # Renombrar columnas al formato esperado por la aplicación
+                df_txt = df_txt.rename(columns={
+                    'Equipo': 'codigo_tanque',
+                    'Transportista': 'nombre_transportista',
+                    'Uso': 'uso'
+                })
+                
+                # Obtener mapeo de uso a mineras
+                mapeo_uso = obtener_mapeo_uso_mineras()
+                
+                # Invertir el mapeo para buscar por minera
+                uso_values = [uso for uso, minera in mapeo_uso.items() if minera == minera_nombre]
+                print(f"   ✓ Valores de 'Uso' buscados para {minera_nombre}: {uso_values}")
+                
+                if not uso_values:
+                    print(f"   ⚠️ No se encontró mapeo de uso para minera: {minera_nombre}")
+                    print(f"{'='*80}\n")
+                    return pd.DataFrame()
+                
+                # Mostrar valores únicos de 'uso' en el TXT para debug
+                print(f"   ✓ Valores únicos de 'Uso' en TXT: {df_txt['uso'].unique().tolist()}")
+                
+                # Filtrar por minera (todos están activos, no hay columna 'estado')
+                df_flota = df_txt[df_txt['uso'].isin(uso_values)].copy()
+                print(f"   ✓ Vehículos encontrados después de filtrar por uso: {len(df_flota)}")
+                
+                if df_flota.empty:
+                    print(f"   ⚠️ No se encontraron vehículos para {minera_nombre} en TXT")
+                    print(f"{'='*80}\n")
+                    return pd.DataFrame()
+                
+                # Convertir codigo_tanque a int
+                df_flota['codigo_tanque'] = df_flota['codigo_tanque'].astype(int)
+                print(f"   ✓ Códigos de tanque convertidos a enteros")
+                
+                # Eliminar duplicados
+                df_flota = df_flota.drop_duplicates(subset=['codigo_tanque'], keep='first')
+                print(f"   ✓ Duplicados eliminados (si existían)")
+                
+                # Mostrar primeros vehículos como muestra
+                print(f"   ✓ Muestra de vehículos cargados:")
+                for idx, row in df_flota.head(3).iterrows():
+                    print(f"      - Equipo {row['codigo_tanque']}: {row['nombre_transportista']} (Uso: {row['uso']})")
+                
+                print(f"   ✅ FLOTA CARGADA EXITOSAMENTE DESDE TXT")
+                print(f"   ✅ Total de vehículos: {len(df_flota)} para {minera_nombre}")
+                print(f"{'='*80}\n")
+                return df_flota
+            else:
+                print(f"   ❌ TXT no tiene las columnas requeridas: {columnas_requeridas}")
+                print(f"   ❌ Columnas encontradas: {list(df_txt.columns)}")
+                print(f"{'='*80}\n")
+        except Exception as e:
+            print(f"   ❌ Error leyendo TXT local: {e}")
+            print(f"   ↪️  Intentando con Excel como fallback...")
+            print(f"{'='*80}\n")
+    else:
+        print(f"\n{'='*80}")
+        print(f"📁 TXT NO ENCONTRADO en ninguna ubicación")
+        print(f"   Ubicaciones buscadas:")
+        for ruta in rutas_txt_posibles:
+            print(f"   - {ruta}")
+        print(f"↪️  Intentando con Excel como fallback...")
+        print(f"{'='*80}\n")
+    
+    # PRIORIDAD 2: Intentar leer desde Excel local
+    ruta_excel = os.path.join(os.path.dirname(__file__), 'Flota_20260108.xlsx')
+    
+    if os.path.exists(ruta_excel):
+        try:
+            print(f"\n{'='*80}")
+            print(f"📊 LEYENDO FLOTA DESDE EXCEL LOCAL")
+            print(f"   Ruta: {ruta_excel}")
+            print(f"   Minera solicitada: {minera_nombre}")
+            df_excel = pd.read_excel(ruta_excel)
+            print(f"   ✓ Excel cargado exitosamente")
+            print(f"   ✓ Total de registros en Excel: {len(df_excel)}")
+            print(f"   ✓ Columnas encontradas: {list(df_excel.columns)}")
+            
+            # Validar columnas requeridas (según estructura del nuevo Excel)
+            columnas_requeridas = ['Equipo', 'Transportista', 'Uso']
+            if all(col in df_excel.columns for col in columnas_requeridas):
+                # Renombrar columnas al formato esperado por la aplicación
+                df_excel = df_excel.rename(columns={
+                    'Equipo': 'codigo_tanque',
+                    'Transportista': 'nombre_transportista',
+                    'Uso': 'uso'
+                })
+                
+                # Obtener mapeo de uso a mineras
+                mapeo_uso = obtener_mapeo_uso_mineras()
+                
+                # Invertir el mapeo para buscar por minera
+                uso_values = [uso for uso, minera in mapeo_uso.items() if minera == minera_nombre]
+                print(f"   ✓ Valores de 'Uso' buscados para {minera_nombre}: {uso_values}")
+                
+                if not uso_values:
+                    print(f"   ⚠️ No se encontró mapeo de uso para minera: {minera_nombre}")
+                    print(f"{'='*80}\n")
+                    return pd.DataFrame()
+                
+                # Mostrar valores únicos de 'uso' en el Excel para debug
+                print(f"   ✓ Valores únicos de 'Uso' en Excel: {df_excel['uso'].unique().tolist()}")
+                
+                # Filtrar por minera (todos están activos, no hay columna 'estado')
+                df_flota = df_excel[df_excel['uso'].isin(uso_values)].copy()
+                print(f"   ✓ Vehículos encontrados después de filtrar por uso: {len(df_flota)}")
+                
+                if df_flota.empty:
+                    print(f"   ⚠️ No se encontraron vehículos para {minera_nombre} en Excel")
+                    print(f"{'='*80}\n")
+                    return pd.DataFrame()
+                
+                # Convertir codigo_tanque a int
+                df_flota['codigo_tanque'] = df_flota['codigo_tanque'].astype(int)
+                print(f"   ✓ Códigos de tanque convertidos a enteros")
+                
+                # Eliminar duplicados
+                df_flota = df_flota.drop_duplicates(subset=['codigo_tanque'], keep='first')
+                print(f"   ✓ Duplicados eliminados (si existían)")
+                
+                # Mostrar primeros vehículos como muestra
+                print(f"   ✓ Muestra de vehículos cargados:")
+                for idx, row in df_flota.head(3).iterrows():
+                    print(f"      - Equipo {row['codigo_tanque']}: {row['nombre_transportista']} (Uso: {row['uso']})")
+                
+                print(f"   ✅ FLOTA CARGADA EXITOSAMENTE DESDE EXCEL")
+                print(f"   ✅ Total de vehículos: {len(df_flota)} para {minera_nombre}")
+                print(f"{'='*80}\n")
+                return df_flota
+            else:
+                print(f"   ❌ Excel no tiene las columnas requeridas: {columnas_requeridas}")
+                print(f"   ❌ Columnas encontradas: {list(df_excel.columns)}")
+                print(f"{'='*80}\n")
+        except Exception as e:
+            print(f"   ❌ Error leyendo Excel local: {e}")
+            print(f"   ↪️  Intentando con Athena como fallback...")
+            print(f"{'='*80}\n")
+    else:
+        print(f"\n{'='*80}")
+        print(f"📁 Excel local NO ENCONTRADO: {ruta_excel}")
+        print(f"↪️  Usando Athena como fallback...")
+        print(f"{'='*80}\n")
+    
+    # PRIORIDAD 3: Fallback a Athena si no hay TXT/Excel o hay error
     if not USE_ATHENA:
         return pd.DataFrame()
     
@@ -735,7 +933,7 @@ def obtener_flota_licitada_athena(minera_nombre):
     try:
         df_flota = sql_athena(query)
         if df_flota.empty:
-            print(f"No se encontraron vehículos licitados para {minera_nombre}")
+            print(f"No se encontraron vehículos licitados para {minera_nombre} en Athena")
             return pd.DataFrame()
         
         # Convertir codigo_tanque a int
@@ -745,6 +943,7 @@ def obtener_flota_licitada_athena(minera_nombre):
         # Priorizar el primer registro encontrado
         df_flota = df_flota.drop_duplicates(subset=['codigo_tanque'], keep='first')
         
+        print(f"✅ Flota cargada desde Athena: {len(df_flota)} vehículos para {minera_nombre}")
         return df_flota
     except Exception as e:
         print(f"Error obteniendo flota licitada de Athena: {e}")
@@ -909,7 +1108,7 @@ def obtener_actividad_flota_licitada(minera_nombre, fecha_inicio, fecha_fin):
         actividad_flota.append({
             'codigo_tanque': codigo_tanque,
             'nombre_transportista': vehiculo['nombre_transportista'],
-            'estado': vehiculo['estado'],
+            'estado': 'Activo',  # Todos están activos en el Excel nuevo
             'uso': vehiculo['uso'],
             'turnos_enviados': turnos,
             'conexiones_rco': conexiones,
@@ -1294,6 +1493,14 @@ def index():
     return render_template('index.html', mineras=mineras, data_source=data_source)
 
 
+@app.route('/exportar')
+@auth.login_required
+def exportar():
+    """Vista para exportar datos a Excel"""
+    mineras = obtener_mineras_athena()
+    return render_template('exportar.html', mineras=mineras)
+
+
 @app.route('/detalle')
 @auth.login_required
 def detalle():
@@ -1311,12 +1518,15 @@ def detalle():
     registros = []
     banda_info = {}
     datos_completos = None
+    datos_completos_camiones = []  # Nueva variable para tabla de detalle por camión
+    datos_completos_originales = None  # Guardar datos completos sin filtrar
     
-    if USE_ATHENA and minera_nombre and fecha:
+    if USE_ATHENA and minera_nombre and fecha and transportista_nombre:
         fecha_obj = datetime.strptime(fecha, '%Y-%m-%d').date()
         
         # Obtener datos completos (SCR + Turnos + RCO)
-        datos_completos = obtener_datos_completos_athena(minera_nombre, fecha_obj, fecha_obj)
+        datos_completos_originales = obtener_datos_completos_athena(minera_nombre, fecha_obj, fecha_obj)
+        datos_completos = datos_completos_originales  # Copiar referencia
         
         if datos_completos is not None and not datos_completos.empty:
             # Manejar el caso especial de "OTRO TRANSPORTISTA"
@@ -1340,51 +1550,238 @@ def detalle():
                     registros = df_scr_filtrado.to_dict('records')
             else:
                 # Caso normal: filtrar por transportista específico   
-                if transportista_nombre:
-                    datos_completos_filtrados = datos_completos[datos_completos['Transportista'] == transportista_nombre]
-                else:
-                    datos_completos_filtrados = datos_completos
+                datos_completos_filtrados = datos_completos[datos_completos['Transportista'] == transportista_nombre]
                 
                 # Para mantener compatibilidad con el template existente, 
                 # también obtenemos los datos SCR básicos para los registros individuales
                 df_scr = obtener_datos_desde_athena(minera_nombre, fecha_obj, fecha_obj)
                 if df_scr is not None and not df_scr.empty:
-                    if transportista_nombre:
-                        df_scr = df_scr[df_scr['Transportista'] == transportista_nombre]
+                    df_scr = df_scr[df_scr['Transportista'] == transportista_nombre]
                     registros = df_scr.to_dict('records')
             
             # Calcular bandas por transportista usando todos los transportistas con datos completos
-            if not datos_completos_filtrados.empty:
+            # NOTA: Esta sección será sobrescrita por la nueva lógica más abajo si hay flota licitada
+            if not datos_completos_filtrados.empty and transportista_nombre == 'OTRO TRANSPORTISTA':
+                # Solo para OTRO TRANSPORTISTA (fallback)
                 transportistas_unicos = datos_completos_filtrados['Transportista'].unique()
-                banda_total = 0
                 bandas_por_transportista = {}
                 
-                if transportista_nombre == 'OTRO TRANSPORTISTA':
-                    # Para OTRO TRANSPORTISTA, no calcular bandas sino contar entregas
-                    for transp in transportistas_unicos:
-                        bandas_por_transportista[transp] = None  # Sin banda
-                    banda_total = None  # No aplica concepto de banda total
-                else:
-                    # Caso normal: calcular bandas
-                    for transp in transportistas_unicos:
-                        banda = calcular_banda_transportista(transp, minera_nombre)
-                        bandas_por_transportista[transp] = banda
-                        if banda:
-                            banda_total += banda
+                for transp in transportistas_unicos:
+                    bandas_por_transportista[transp] = None  # Sin banda
                 
                 # Calcular disponibilidad operacional según nueva métrica
-                disponibilidad_operacional = calcular_disponibilidad_operacional(datos_completos_filtrados, banda_total)
+                disponibilidad_operacional = calcular_disponibilidad_operacional(datos_completos_filtrados, None)
                 
                 banda_info = {
-                    'banda_total': banda_total,
+                    'banda_total': None,
                     'bandas_por_transportista': bandas_por_transportista,
                     'transportistas_unicos': list(transportistas_unicos),
-                    'es_otro_transportista': transportista_nombre == 'OTRO TRANSPORTISTA',
+                    'es_otro_transportista': True,
                     'disponibilidad_operacional': disponibilidad_operacional
                 }
                 
                 # Usar los datos filtrados para el template
                 datos_completos = datos_completos_filtrados
+        
+        # NUEVA LÓGICA: Usar las mismas queries que obtener_actividad_flota_licitada
+        # pero filtrada solo por el transportista seleccionado
+        if transportista_nombre != 'OTRO TRANSPORTISTA':
+            # Obtener flota licitada completa para la minera
+            df_flota = obtener_flota_licitada_athena(minera_nombre)
+            
+            if not df_flota.empty:
+                # Extraer palabras clave del nombre del transportista
+                palabras_transportista = [
+                    palabra for palabra in transportista_nombre.upper().replace('.', '').replace(',', '').split()
+                    if len(palabra) > 3
+                ]
+                
+                print(f"\n{'='*80}")
+                print(f"🚛 BUSCANDO FLOTA DEL TRANSPORTISTA")
+                print(f"   Transportista buscado: {transportista_nombre}")
+                print(f"   Palabras clave: {palabras_transportista}")
+                
+                # Filtrar vehículos del transportista
+                def match_transportista(nombre_flota):
+                    if pd.isna(nombre_flota):
+                        return False
+                    nombre_normalizado = nombre_flota.upper().replace('.', '').replace(',', '')
+                    return all(palabra in nombre_normalizado for palabra in palabras_transportista)
+                
+                df_flota_transportista = df_flota[
+                    df_flota['nombre_transportista'].apply(match_transportista)
+                ].copy()
+                
+                print(f"   ✓ Total vehículos encontrados en flota: {len(df_flota_transportista)}")
+                
+                if not df_flota_transportista.empty:
+                    vehiculos_transportista = df_flota_transportista['codigo_tanque'].tolist()
+                    
+                    # 1. Obtener turnos enviados (MISMA QUERY que obtener_actividad_flota_licitada)
+                    query_turnos = f"""
+                    SELECT id_vehiculo, COUNT(DISTINCT id_turno_uuid) as turnos_enviados
+                    FROM (
+                        SELECT id_turno_uuid, id_vehiculo, estado,
+                               ROW_NUMBER() OVER (PARTITION BY id_turno_uuid ORDER BY fecha_hora DESC) as rn
+                        FROM {DATABASE_DISPOMATE}.{TABLA_TURNOS}
+                        WHERE DATE(fecha_inicio_utc) >= DATE('{fecha}')
+                          AND DATE(fecha_inicio_utc) <= DATE('{fecha}')
+                          AND id_vehiculo IN ({','.join(map(str, vehiculos_transportista))})
+                    )
+                    WHERE rn = 1 AND estado = 'ENVIADO'
+                    GROUP BY id_vehiculo
+                    """
+                    
+                    try:
+                        df_turnos = sql_athena(query_turnos)
+                    except Exception as e:
+                        print(f"   ⚠️ Error obteniendo turnos: {e}")
+                        df_turnos = pd.DataFrame()
+                    
+                    # 2. Obtener conexiones RCO (MISMA QUERY que obtener_actividad_flota_licitada)
+                    query_rco = f"""
+                    SELECT codigo_tanque, COUNT(*) as conexiones_rco
+                    FROM {DATABASE_DISPOMATE}.{TABLA_RCO}
+                    WHERE DATE(fecha_conexion_utc) >= DATE('{fecha}')
+                      AND DATE(fecha_conexion_utc) <= DATE('{fecha}')
+                      AND codigo_tanque IN ({','.join(map(str, vehiculos_transportista))})
+                    GROUP BY codigo_tanque
+                    """
+                    
+                    try:
+                        df_rco = sql_athena(query_rco)
+                    except Exception as e:
+                        print(f"   ⚠️ Error obteniendo conexiones RCO: {e}")
+                        df_rco = pd.DataFrame()
+                    
+                    # 3. Obtener entregas (MISMA QUERY que obtener_actividad_flota_licitada)
+                    query_entregas = f"""
+                    SELECT 
+                        CAST(vehiclereal AS INTEGER) as vehiclereal,
+                        descrstatu as estado,
+                        COUNT(*) as cantidad
+                    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
+                    WHERE vdatu >= '{fecha}'
+                      AND vdatu <= '{fecha}'
+                      AND CAST(vehiclereal AS INTEGER) IN ({','.join(map(str, vehiculos_transportista))})
+                    GROUP BY CAST(vehiclereal AS INTEGER), descrstatu
+                    """
+                    
+                    try:
+                        df_entregas = sql_athena(query_entregas)
+                        if not df_entregas.empty:
+                            df_entregas['vehiclereal'] = df_entregas['vehiclereal'].astype(int)
+                    except Exception as e:
+                        print(f"   ⚠️ Error obteniendo entregas: {e}")
+                        df_entregas = pd.DataFrame()
+                    
+                    # 4. Combinar información para cada vehículo
+                    for _, vehiculo in df_flota_transportista.iterrows():
+                        codigo_tanque = int(vehiculo['codigo_tanque'])
+                        
+                        # Turnos enviados
+                        turnos_enviados = 0
+                        if not df_turnos.empty and 'id_vehiculo' in df_turnos.columns:
+                            turno_row = df_turnos[df_turnos['id_vehiculo'] == codigo_tanque]
+                            if not turno_row.empty:
+                                turnos_enviados = int(turno_row['turnos_enviados'].iloc[0])
+                        
+                        # Conexiones RCO
+                        conexion_rco = 0
+                        if not df_rco.empty and 'codigo_tanque' in df_rco.columns:
+                            rco_row = df_rco[df_rco['codigo_tanque'] == codigo_tanque]
+                            if not rco_row.empty:
+                                conexion_rco = int(rco_row['conexiones_rco'].iloc[0])
+                        
+                        # Entregas
+                        entregado_totalmente = 0
+                        en_ruta = 0
+                        planificado = 0
+                        
+                        if not df_entregas.empty:
+                            entregas_vehiculo = df_entregas[df_entregas['vehiclereal'] == codigo_tanque]
+                            
+                            if not entregas_vehiculo.empty:
+                                # Entregado totalmente
+                                entregas_completadas = entregas_vehiculo[
+                                    entregas_vehiculo['estado'].isin(['Entregado totalmente', 'Recibí Conforme'])
+                                ]
+                                entregado_totalmente = int(entregas_completadas['cantidad'].sum()) if not entregas_completadas.empty else 0
+                                
+                                # En Ruta
+                                en_ruta_rows = entregas_vehiculo[entregas_vehiculo['estado'] == 'En Ruta']
+                                en_ruta = int(en_ruta_rows['cantidad'].sum()) if not en_ruta_rows.empty else 0
+                                
+                                # Planificado
+                                planificado_rows = entregas_vehiculo[entregas_vehiculo['estado'] == 'Planificado']
+                                planificado = int(planificado_rows['cantidad'].sum()) if not planificado_rows.empty else 0
+                        
+                        # LÓGICA DE DISPONIBILIDAD (2 criterios activos):
+                        disponible = 0
+                        if entregado_totalmente > 0:
+                            disponible = 1
+                        elif conexion_rco > 0:
+                            disponible = 1
+                        
+                        datos_completos_camiones.append({
+                            'Camion': codigo_tanque,
+                            'Fecha': fecha,
+                            'Es_licitado': 'Si',
+                            'Transportista': vehiculo['nombre_transportista'],
+                            'Turnos_enviados': turnos_enviados,
+                            'Conexion_RCO': conexion_rco,
+                            'Entregado_totalmente': entregado_totalmente,
+                            'En_ruta': en_ruta,
+                            'Planificado': planificado,
+                            'Disponible': disponible
+                        })
+                    
+                    print(f"   ✅ Procesados {len(datos_completos_camiones)} vehículos")
+                    print(f"{'='*80}\n")
+                    
+                    # Calcular KPI de Disponibilidad Operacional con los datos correctos
+                    if datos_completos_camiones:
+                        # Sumar total de camiones disponibles
+                        camiones_disponibles = sum(camion['Disponible'] for camion in datos_completos_camiones)
+                        
+                        # Obtener banda del transportista
+                        banda_transportista = calcular_banda_transportista(transportista_nombre, minera_nombre)
+                        
+                        # Calcular porcentaje
+                        if banda_transportista and banda_transportista > 0:
+                            disponibilidad_porcentaje = (camiones_disponibles / banda_transportista) * 100
+                            disponibilidad_porcentaje = min(100.0, disponibilidad_porcentaje)
+                        else:
+                            disponibilidad_porcentaje = 0.0
+                        
+                        # Calcular disponibilidad licitada (todos los camiones en datos_completos_camiones son licitados)
+                        entregas_totales = sum(camion['Entregado_totalmente'] for camion in datos_completos_camiones)
+                        entregas_licitadas = entregas_totales  # Todos son licitados
+                        
+                        disponibilidad_licitada_porcentaje = 100.0 if entregas_totales > 0 else 0.0
+                        
+                        # Crear estructura de disponibilidad operacional
+                        disponibilidad_operacional = {
+                            'disponibilidad_porcentaje': round(disponibilidad_porcentaje, 1),
+                            'camiones_disponibles': camiones_disponibles,
+                            'banda_total': banda_transportista,
+                            'entregas_exitosas_total': camiones_disponibles,  # Para compatibilidad
+                            'entregas_criterio_a': sum(1 for c in datos_completos_camiones if c['Entregado_totalmente'] > 0),
+                            'entregas_criterio_b': sum(1 for c in datos_completos_camiones if c['Entregado_totalmente'] == 0 and c['Conexion_RCO'] > 0),
+                            'turnos_enviados_total': sum(camion['Turnos_enviados'] for camion in datos_completos_camiones),
+                            'entregas_licitadas': entregas_licitadas,
+                            'entregas_totales': entregas_totales,
+                            'disponibilidad_licitada_porcentaje': round(disponibilidad_licitada_porcentaje, 1)
+                        }
+                        
+                        banda_info = {
+                            'banda_total': banda_transportista,
+                            'bandas_por_transportista': {transportista_nombre: banda_transportista},
+                            'transportistas_unicos': [transportista_nombre],
+                            'es_otro_transportista': False,
+                            'disponibilidad_operacional': disponibilidad_operacional
+                        }
+                        
 
     # Obtener información de flota licitada con actividad detallada para la minera
     flota_licitada = []
@@ -1405,11 +1802,328 @@ def detalle():
                          transportista=transportista_nombre,
                          fecha=fecha,
                          registros=registros,
-                         datos_completos=datos_completos.to_dict('records') if datos_completos is not None and not datos_completos.empty else [],
+                         datos_completos=datos_completos_camiones if datos_completos_camiones else [],
                          banda_info=banda_info,
                          flota_licitada=flota_licitada,
                          mineras=mineras,
                          transportistas=transportistas)
+
+
+# ============================================
+# FUNCIÓN DE EXPORTACIÓN MATRICIAL XLSX
+# ============================================
+def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, minera_nombre):
+    """
+    Generar archivo XLSX con formato matricial por transportista LICITADO
+    Solo incluye transportistas que tienen vehículos licitados
+    
+    Args:
+        df_export: DataFrame con los datos
+        fecha_inicio: datetime - Fecha de inicio
+        fecha_fin: datetime - Fecha de fin
+        output_buffer: BytesIO buffer donde guardar el archivo
+        minera_nombre: str - Nombre de la minera para obtener bandas
+    """
+    
+    # Crear workbook
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)  # Remover hoja por defecto
+    
+    # Filtrar solo transportistas LICITADOS
+    df_licitados = df_export[df_export['Es_Licitado'] == 'Si'].copy()
+    
+    if df_licitados.empty:
+        # Crear hoja con mensaje
+        ws = workbook.create_sheet(title="Sin Datos")
+        ws['A1'] = "No se encontraron transportistas con flota licitada para esta minera"
+        workbook.save(output_buffer)
+        return
+    
+    # Obtener solo transportistas que tienen vehículos licitados
+    transportistas_licitados = sorted(df_licitados['Transportista'].unique())
+    
+    # Separar datos de transportistas NO licitados para hoja separada
+    df_no_licitados = df_export[df_export['Es_Licitado'] == 'No'].copy()
+    
+    # Obtener rango de fechas
+    fechas = pd.date_range(start=fecha_inicio, end=fecha_fin, freq='D')
+    num_dias = len(fechas)
+    
+    # Estilos
+    header_fill = PatternFill(start_color="0066CC", end_color="0066CC", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    center_alignment = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    # Crear una hoja por transportista LICITADO
+    for transportista in transportistas_licitados:
+        # Filtrar SOLO datos de flota licitada del transportista
+        df_transp = df_licitados[df_licitados['Transportista'] == transportista].copy()
+        
+        # Crear worksheet
+        ws = workbook.create_sheet(title=transportista[:31])  # Límite de 31 caracteres
+        
+        # SECCIÓN DE CONFIGURACIÓN
+        ws.merge_cells('B1:H1')
+        ws.merge_cells('B2:H2')
+        cell_config = ws['B1']
+        cell_config.value = 'Configuración de banda minima'
+        cell_config.font = Font(bold=True)
+        
+        ws.merge_cells('I1:P1')
+        ws.merge_cells('I2:P2')
+        cell_max = ws['I1']
+        cell_max.value = 'Configuración de banda maxima'
+        cell_max.font = Font(bold=True)
+              
+        # Fila 2 - Valores de configuración (banda del transportista)
+        banda_transportista = calcular_banda_transportista(transportista, minera_nombre)
+        if banda_transportista:
+            ws['B2'] = banda_transportista
+            ws['I2'] = banda_transportista
+        else:
+            ws['B2'] = 0
+            ws['I2'] = 0
+        
+        # Columna de Disponibilidad del periodo
+        col_disp_start = 22 + (num_dias * 3)
+        ws.cell(row=1, column=col_disp_start).value = 'Disponibilidad del periodo'
+        ws.cell(row=1, column=col_disp_start).font = Font(bold=True)
+        
+        # Calcular disponibilidad del transportista
+        resultado_disp = calcular_disponibilidad_operacional(df_transp)
+        ws.cell(row=2, column=col_disp_start).value = resultado_disp['disponibilidad_porcentaje'] / 100
+        ws.cell(row=2, column=col_disp_start).number_format = '0.00'
+        
+        # ENCABEZADOS DE DÍAS
+        row_dia = 5
+        row_criterio = 6
+        
+        ws['A5'] = 'Día'
+        ws['A6'] = 'Camion \\ Criterio'
+        
+        # Configurar encabezados de días y criterios
+        current_col = 2  # Columna B
+        for fecha in fechas:
+            dia_numero = fecha.day
+            
+            # Día (se repite en 3 columnas)
+            ws.merge_cells(start_row=row_dia, start_column=current_col, 
+                          end_row=row_dia, end_column=current_col + 2)
+            cell_dia = ws.cell(row=row_dia, column=current_col)
+            cell_dia.value = dia_numero
+            cell_dia.alignment = center_alignment
+            
+            # Criterios 1, 2, 3
+            for criterio in [1, 2, 3]:
+                ws.cell(row=row_criterio, column=current_col).value = criterio
+                ws.cell(row=row_criterio, column=current_col).alignment = center_alignment
+                current_col += 1
+        
+        # Aplicar formato a encabezados
+        for col in range(1, current_col):
+            for row in [row_dia, row_criterio]:
+                cell = ws.cell(row=row, column=col)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_alignment
+        
+        # DATOS DE CAMIONES
+        camiones = sorted(df_transp['Camion'].unique())
+        
+        for idx_camion, camion in enumerate(camiones):
+            row_actual = 7 + idx_camion
+            
+            # Nombre del camión en columna A
+            ws.cell(row=row_actual, column=1).value = int(camion)
+            
+            # Filtrar datos del camión
+            df_camion = df_transp[df_transp['Camion'] == camion].copy()
+            
+            # Crear diccionario fecha -> datos para acceso rápido
+            df_camion['fecha_key'] = pd.to_datetime(df_camion['fecha_completa']).dt.date
+            datos_por_fecha = df_camion.set_index('fecha_key').to_dict('index')
+            
+            # Llenar datos por fecha
+            current_col = 2
+            for fecha in fechas:
+                fecha_key = fecha.date()
+                
+                # Obtener datos del día (si existen)
+                if fecha_key in datos_por_fecha:
+                    datos_dia = datos_por_fecha[fecha_key]
+                    entregado = datos_dia.get('Entregado_totalmente', 0)
+                    conexion_rco = datos_dia.get('Conexion_RCO', 0)
+                    en_ruta = datos_dia.get('En_ruta', 0)
+                    planificado = datos_dia.get('Planificado', 0)
+                    
+                    # Criterio 1: Entrega realizada (Entregado_totalmente > 0)
+                    criterio_1 = 1 if entregado > 0 else 0
+                    
+                    # Criterio 2: No entregado PERO con conexión RCO
+                    criterio_2 = 1 if (entregado == 0 and conexion_rco > 0) else 0
+                    
+                    # Criterio 3: No entregado, sin RCO PERO con estadía en planta
+                    criterio_3 = 1 if (entregado == 0 and conexion_rco == 0 and (en_ruta > 0 or planificado > 0)) else 0
+                else:
+                    # Sin datos para este día
+                    criterio_1 = 0
+                    criterio_2 = 0
+                    criterio_3 = 0
+                
+                # Escribir valores
+                ws.cell(row=row_actual, column=current_col).value = criterio_1
+                ws.cell(row=row_actual, column=current_col + 1).value = criterio_2
+                ws.cell(row=row_actual, column=current_col + 2).value = criterio_3
+                
+                current_col += 3
+        
+        # FILA DE TOTALES POR CRITERIO
+        row_totales = 7 + len(camiones)
+        
+        # Etiqueta de totales
+        cell_totales = ws.cell(row=row_totales, column=1)
+        cell_totales.value = "TOTAL"
+        cell_totales.font = Font(bold=True)
+        cell_totales.alignment = center_alignment
+        
+        # Calcular totales por día y criterio
+        current_col = 2
+        for fecha in fechas:
+            # Para cada día, sumar todos los camiones
+            for offset_criterio in range(3):  # 3 criterios
+                # Construir fórmula de suma para esta columna
+                primera_fila_datos = 7
+                ultima_fila_datos = 7 + len(camiones) - 1
+                col_letter = openpyxl.utils.get_column_letter(current_col)
+                
+                formula = f"=SUM({col_letter}{primera_fila_datos}:{col_letter}{ultima_fila_datos})"
+                cell_total = ws.cell(row=row_totales, column=current_col)
+                cell_total.value = formula
+                cell_total.font = Font(bold=True)
+                cell_total.alignment = center_alignment
+                
+                current_col += 1
+        
+        # FILA DE TOTAL GENERAL (SUMA DE TODOS LOS CRITERIOS)
+        row_total_general = row_totales + 1
+        
+        # Etiqueta
+        cell_total_general = ws.cell(row=row_total_general, column=1)
+        cell_total_general.value = "TOTAL CRITERIOS"
+        cell_total_general.font = Font(bold=True)
+        cell_total_general.alignment = center_alignment
+        cell_total_general.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
+        
+        # Calcular total general por día (suma de los 3 criterios)
+        current_col = 2
+        for fecha in fechas:
+            # Sumar los 3 criterios del día
+            col1_letter = openpyxl.utils.get_column_letter(current_col)
+            col2_letter = openpyxl.utils.get_column_letter(current_col + 1)
+            col3_letter = openpyxl.utils.get_column_letter(current_col + 2)
+            
+            formula = f"={col1_letter}{row_totales}+{col2_letter}{row_totales}+{col3_letter}{row_totales}"
+            
+            # Colocar el total en la primera columna del día y hacer merge de las 3 columnas
+            ws.merge_cells(start_row=row_total_general, start_column=current_col,
+                          end_row=row_total_general, end_column=current_col + 2)
+            
+            cell_general = ws.cell(row=row_total_general, column=current_col)
+            cell_general.value = formula
+            cell_general.font = Font(bold=True, size=11)
+            cell_general.alignment = center_alignment
+            cell_general.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
+            
+            current_col += 3
+        
+        # APLICAR BORDES Y AJUSTAR COLUMNAS
+        # Ajustar ancho de columnas
+        ws.column_dimensions['A'].width = 20
+        for col in range(2, current_col):
+            col_letter = openpyxl.utils.get_column_letter(col)
+            ws.column_dimensions[col_letter].width = 4
+        
+        # Aplicar bordes a la tabla de datos (incluye filas de totales)
+        max_data_row = 7 + len(camiones) + 1  # +2 para incluir ambas filas de totales
+        for row in range(row_dia, max_data_row + 1):
+            for col in range(1, current_col):
+                ws.cell(row=row, column=col).border = thin_border
+    
+    # HOJAS ADICIONALES: LOGS (SOLO FLOTA LICITADA)
+    
+    # HOJA: LOG - Entregas Licitadas
+    ws_entregas = workbook.create_sheet(title='LOG - Entregas Licitadas')
+    entregas_data = df_licitados[df_licitados['Entregado_totalmente'] > 0][
+        ['Fecha', 'Camion', 'Transportista', 'Entregado_totalmente']
+    ].copy()
+    
+    for r_idx, row in enumerate(dataframe_to_rows(entregas_data, index=False, header=True), 1):
+        for c_idx, value in enumerate(row, 1):
+            cell = ws_entregas.cell(row=r_idx, column=c_idx, value=value)
+            if r_idx == 1:  # Encabezado
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_alignment
+    
+    # HOJA: LOG - RCO Licitadas
+    ws_rco = workbook.create_sheet(title='LOG - RCO Licitadas')
+    rco_data = df_licitados[df_licitados['Conexion_RCO'] > 0][
+        ['Fecha', 'Camion', 'Transportista', 'Conexion_RCO']
+    ].copy()
+    
+    for r_idx, row in enumerate(dataframe_to_rows(rco_data, index=False, header=True), 1):
+        for c_idx, value in enumerate(row, 1):
+            cell = ws_rco.cell(row=r_idx, column=c_idx, value=value)
+            if r_idx == 1:  # Encabezado
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_alignment
+    
+    # HOJA: LOG - Eventos Licitadas
+    ws_eventos = workbook.create_sheet(title='LOG - Eventos Licitadas')
+    eventos_data = df_licitados[
+        ['Fecha', 'Camion', 'Transportista', 
+         'Turnos_enviados', 'Conexion_RCO', 'Entregado_totalmente', 'En_ruta', 'Planificado']
+    ].copy()
+    
+    for r_idx, row in enumerate(dataframe_to_rows(eventos_data, index=False, header=True), 1):
+        for c_idx, value in enumerate(row, 1):
+            cell = ws_eventos.cell(row=r_idx, column=c_idx, value=value)
+            if r_idx == 1:  # Encabezado
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_alignment
+    
+    # HOJA ADICIONAL: OTROS TRANSPORTISTAS (NO LICITADOS)
+    if not df_no_licitados.empty:
+        ws_otros = workbook.create_sheet(title='OTROS Transportistas')
+        
+        # Agrupar datos de no licitados por transportista y fecha
+        resumen_otros = df_no_licitados.groupby(['Transportista', 'Fecha']).agg({
+            'Camion': 'count',  # Cantidad de camiones
+            'Turnos_enviados': 'sum',
+            'Conexion_RCO': 'sum',
+            'Entregado_totalmente': 'sum'
+        }).reset_index()
+        resumen_otros.columns = ['Transportista', 'Fecha', 'Cantidad_Camiones', 
+                                  'Turnos_enviados', 'Conexion_RCO', 'Entregado_totalmente']
+        
+        for r_idx, row in enumerate(dataframe_to_rows(resumen_otros, index=False, header=True), 1):
+            for c_idx, value in enumerate(row, 1):
+                cell = ws_otros.cell(row=r_idx, column=c_idx, value=value)
+                if r_idx == 1:  # Encabezado
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = center_alignment
+    
+    # Guardar workbook
+    workbook.save(output_buffer)
 
 
 @app.route('/api/dashboard_data')
@@ -1556,6 +2270,71 @@ def debug_transportistas():
         
     except Exception as e:
         return jsonify({'error': f'Error obteniendo transportistas: {str(e)}'}), 500
+
+
+@app.route('/api/exportar_xlsx')
+@auth.login_required
+def exportar_xlsx():
+    """Generar archivo XLSX con formato matricial para rango de fechas"""
+    try:
+        minera = request.args.get('minera')
+        fecha_inicio_str = request.args.get('fecha_inicio')
+        fecha_fin_str = request.args.get('fecha_fin')
+        
+        if not minera or not fecha_inicio_str or not fecha_fin_str:
+            return jsonify({'error': 'Parámetros requeridos: minera, fecha_inicio, fecha_fin'}), 400
+        
+        # Convertir fechas
+        try:
+            fecha_inicio = datetime.strptime(fecha_inicio_str, '%Y-%m-%d')
+            fecha_fin = datetime.strptime(fecha_fin_str, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({'error': 'Formato de fecha inválido. Use YYYY-MM-DD'}), 400
+        
+        if fecha_inicio > fecha_fin:
+            return jsonify({'error': 'La fecha de inicio no puede ser mayor a la fecha de fin'}), 400
+        
+        # Obtener datos completos para el rango de fechas
+        datos_completos = obtener_datos_completos_athena(minera, fecha_inicio, fecha_fin)
+        
+        if datos_completos is None or datos_completos.empty:
+            return jsonify({'error': 'No se encontraron datos para los parámetros especificados'}), 404
+        
+        # Obtener vehículos licitados
+        vehiculos_licitados = obtener_vehiculos_licitados_por_minera(minera)
+        
+        # Preparar DataFrame para exportación
+        df_export = datos_completos.copy()
+        
+        # Agregar columna de vehículo licitado si no existe
+        if '¿Es licitado?' in df_export.columns:
+            df_export['Es_Licitado'] = df_export['¿Es licitado?']
+        else:
+            df_export['Es_Licitado'] = df_export['Camion'].isin(vehiculos_licitados).map({True: 'Si', False: 'No'})
+        
+        # Crear archivo Excel en memoria
+        output = BytesIO()
+        
+        # Generar Excel con formato matricial
+        exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output, minera)
+        
+        output.seek(0)
+        
+        # Preparar respuesta
+        filename = f"DispoMinera_{minera}_{fecha_inicio_str}_{fecha_fin_str}.xlsx"
+        
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=filename
+        )
+        
+    except Exception as e:
+        print(f"Error generando XLSX: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Error generando archivo: {str(e)}'}), 500
 
 
 @app.route('/api/cache/clear', methods=['POST'])

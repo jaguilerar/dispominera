@@ -11,6 +11,12 @@
 /dispominera.ipynb
 /kpi_mensual.py
 /KPIs_LOS_BRONCES_2025-12.xlsx
+/XLSX DE EJEMPLO.xlsx
+/excel.py
+/test
+
+# Mantenedor de flota (datos sensibles)
+/mantenedor_flota.txt
 
 # Archivos de Python adicionales
 *.py[cod]
