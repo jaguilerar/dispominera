@@ -562,14 +562,13 @@ function updateMatrix(matrizData, minera) {
                 // Para transportistas autorizados, mostrar porcentaje con colores
                 const colorClass = celda.porcentaje >= 80 ? 'green' : 'red';
                 
-                // Usar datos reales del backend
-                const dispOp = celda.disponibilidad_operacional || {porcentaje: 0, turnos_enviados: 0, entregas_exitosas: 0};
-                const dispOperacional = dispOp.porcentaje || 0;
-                const turnosEnviados = dispOp.turnos_enviados || 0;
-                const entregasExitosas = dispOp.entregas_exitosas || 0;
+                // Disponibilidad Operacional es el porcentaje principal de la celda
+                const dispOperacional = celda.porcentaje || 0;
                 
-                const dispBanda = celda.porcentaje;
+                // Disponibilidad por Banda (solo entregas/banda sin criterio B)
+                const dispBanda = celda.disponibilidad_banda || 0;
                 
+                // Entregas por Flota Licitada
                 const entregasLicitadas = celda.entregas_licitadas || 0;
                 const entregasTotales = celda.entregas_totales || 0;
                 const dispLicitadaPct = entregasTotales > 0 ? Math.round((entregasLicitadas / entregasTotales) * 100) : 0;
@@ -581,7 +580,7 @@ function updateMatrix(matrizData, minera) {
                 html += `<td>
                     <div class="percentage-circle ${colorClass}" 
                          onclick="goToDetail('${minera}', '${transportista}', '${celda.fecha_full}')">
-                        ${celda.porcentaje}%
+                        ${dispOperacional.toFixed(1)}%
                         <div class="tooltip-content">
                             <div class="tooltip-metrics">
                                 <div class="tooltip-metric">
@@ -590,7 +589,7 @@ function updateMatrix(matrizData, minera) {
                                 </div>
                                 <div class="tooltip-metric">
                                     <div class="tooltip-metric-label">Cumpl. Por Banda</div>
-                                    <div class="tooltip-metric-value" style="color: ${colorDispBanda};">${dispBanda}%</div>
+                                    <div class="tooltip-metric-value" style="color: ${colorDispBanda};">${dispBanda.toFixed(1)}%</div>
                                 </div>
                                 <div class="tooltip-metric">
                                     <div class="tooltip-metric-label">Entreg. por Flota Licitada</div>

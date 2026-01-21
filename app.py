@@ -2,7 +2,7 @@ from flask import Flask, render_template, request, jsonify, send_file
 from flask_httpauth import HTTPBasicAuth
 from flask_caching import Cache
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import os
 import pandas as pd
 import numpy as np
@@ -14,6 +14,7 @@ from io import BytesIO
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
+import re
 
 load_dotenv()
 
@@ -48,6 +49,26 @@ app.config.update(cache_config)
 cache = Cache(app)
 
 print(f"📦 Caché configurado: {cache_config['CACHE_TYPE']} (timeout: {cache_config['CACHE_DEFAULT_TIMEOUT']}s)")
+
+# ============================================
+# UTILIDAD PARA LIMPIAR NaN EN JSON
+# ============================================
+def clean_nan_for_json(obj):
+    """
+    Recursivamente limpia valores NaN/inf para que sean JSON-serializables.
+    Convierte NaN, inf, -inf a None.
+    """
+    if isinstance(obj, dict):
+        return {k: clean_nan_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_nan_for_json(item) for item in obj]
+    elif isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return obj
+    elif pd.isna(obj):
+        return None
+    return obj
 
 # ============================================
 # MIDDLEWARE PARA MEDICIÓN DE TIEMPOS
@@ -126,23 +147,18 @@ athena_conn = None
 # ============================================
 def generar_cache_key(prefix, *args, **kwargs):
     """Generar clave única para cache basada en parámetros"""
-    # Crear string único con todos los parámetros
     key_data = f"{prefix}_{args}_{sorted(kwargs.items())}"
-    # Hash para mantener claves cortas
     key_hash = hashlib.md5(key_data.encode()).hexdigest()[:12]
     return f"{prefix}_{key_hash}"
 
 def invalidar_cache_minera(minera_nombre):
     """Invalidar todo el cache relacionado con una minera específica"""
-    # Flask-Caching no tiene invalidación por patrón en SimpleCache
-    # Esta función es un placeholder para cuando se use Redis
     cache.clear()
     print(f"🗑️ Cache invalidado para minera: {minera_nombre}")
 
 # ============================================
-# FIN FUNCIONES HELPER PARA CACHÉ
+# CONEXIÓN A ATHENA
 # ============================================
-
 def get_athena_connection():
     """Obtener o crear conexión a Athena"""
     global athena_conn
@@ -173,35 +189,278 @@ def sql_athena(query):
         return pd.DataFrame()
 
 
+# ============================================
+# PARSER DE TURNOS DESDE MANTENEDOR DE FLOTA
+# ============================================
+
+def parsear_turnos_detalle(turnos_detalle_str):
+    """
+    Parsear la columna 'Turnos detalle' del mantenedor de flota.
+    
+    Formato esperado:
+    - Un turno: "07:00:00 - Lunes,Martes,Miercoles,Jueves,Viernes,Sábado"
+    - Múltiples turnos (separados por salto de línea o \\n):
+      "07:00:00 - Domingo,Lunes,Martes,Miercoles,Jueves,Viernes,Sábado
+       19:00:00 - Domingo,Lunes,Martes,Miercoles,Jueves,Viernes,Sábado"
+    
+    Returns:
+        List[dict]: Lista de turnos con estructura:
+            [
+                {
+                    'hora_inicio': '07:00:00',
+                    'dias': ['Lunes', 'Martes', ...],
+                    'turno_nombre': 'Turno AM'  # o 'Turno PM', 'Turno Noche'
+                },
+                ...
+            ]
+    """
+    if pd.isna(turnos_detalle_str) or not turnos_detalle_str or turnos_detalle_str.strip() == '':
+        return []
+    
+    # Limpiar el string y separar por saltos de línea (pueden ser \n o literales)
+    turnos_str = str(turnos_detalle_str).strip()
+    
+    # Manejar strings con comillas dobles que envuelven múltiples líneas
+    if turnos_str.startswith('"') and turnos_str.endswith('"'):
+        turnos_str = turnos_str[1:-1]
+    
+    # Separar por saltos de línea (tanto \n como saltos literales)
+    lineas_turnos = [linea.strip() for linea in re.split(r'\n|\\n', turnos_str) if linea.strip()]
+    
+    turnos_parseados = []
+    
+    for idx, linea in enumerate(lineas_turnos):
+        # Formato: "HH:MM:SS - Dia1,Dia2,Dia3..."
+        partes = linea.split(' - ', 1)
+        
+        if len(partes) != 2:
+            continue
+        
+        hora_inicio = partes[0].strip()
+        dias_str = partes[1].strip()
+        
+        # Separar días
+        dias = [dia.strip() for dia in dias_str.split(',')]
+        
+        # Usar la hora directamente como nombre del turno (formato HH:MM)
+        try:
+            hora_obj = datetime.strptime(hora_inicio, '%H:%M:%S').time()
+            turno_nombre = hora_obj.strftime('%H:%M')  # Formato 07:00, 19:00, etc.
+        except:
+            # Si no se puede parsear la hora, usar la hora tal cual o índice
+            turno_nombre = hora_inicio if hora_inicio else f'Turno {idx + 1}'
+        
+        turnos_parseados.append({
+            'hora_inicio': hora_inicio,
+            'dias': dias,
+            'turno_nombre': turno_nombre
+        })
+    
+    return turnos_parseados
+
+@cache.memoize(timeout=3600)  # Cache por 1 hora
+def cargar_mantenedor_flota():
+    """
+    Cargar el archivo mantenedor_flota.txt y parsearlo.
+    
+    Returns:
+        pd.DataFrame con columnas:
+            - Equipo (código del camión)
+            - Transportista
+            - Turnos (lista de diccionarios con información de turnos)
+    """
+    print("🔄 [CACHE MISS] Cargando mantenedor de flota...")
+    
+    # Ruta al archivo (ajustar según tu configuración)
+    rutas_txt_posibles = [
+        '/etc/secrets/mantenedor_flota.txt',  # Render Secret Files (ubicación alternativa)
+        os.path.join(os.path.dirname(__file__), 'mantenedor_flota.txt'),  # Raíz de la app (Render o local)
+        os.path.join(os.path.dirname(__file__), 'Flota_20260108 - copia.txt')  # Nombre alternativo local
+    ]
+    
+    ruta_mantenedor = None
+    for ruta in rutas_txt_posibles:
+        if os.path.exists(ruta):
+            ruta_mantenedor = ruta
+            break
+    
+    if not os.path.exists(ruta_mantenedor):
+        print(f"⚠️ Archivo mantenedor no encontrado: {ruta_mantenedor}")
+        return pd.DataFrame()
+    
+    try:
+        # Leer archivo delimitado por tabuladores
+        df_flota = pd.read_csv(ruta_mantenedor, sep='\t', encoding='latin-1')
+        
+        # Parsear turnos para cada vehículo
+        df_flota['Turnos_parseados'] = df_flota['Turnos detalle'].apply(parsear_turnos_detalle)
+        
+        # Quedarnos solo con las columnas relevantes
+        df_flota_limpio = df_flota[['Equipo', 'Transportista', 'Turnos_parseados']].copy()
+        df_flota_limpio = df_flota_limpio.rename(columns={'Equipo': 'Camion'})
+        
+        print(f"✅ Mantenedor cargado: {len(df_flota_limpio)} vehículos")
+        
+        return df_flota_limpio
+        
+    except Exception as e:
+        print(f"❌ Error cargando mantenedor de flota: {e}")
+        return pd.DataFrame()
+
+def expandir_turnos_a_registros(df_base, df_mantenedor):
+    """
+    Expandir un DataFrame de [Camión, Fecha] a [Camión, Fecha, Turno]
+    usando la información del mantenedor de flota.
+    
+    Crea un registro por cada turno activo en el día, permitiendo ver
+    todos los turnos incluso si no tienen actividad.
+    
+    Args:
+        df_base: DataFrame con estructura [Camion, fecha_completa, ...]
+        df_mantenedor: DataFrame del mantenedor con turnos parseados
+    
+    Returns:
+        DataFrame expandido con una fila por cada turno activo
+    """
+    print("🔄 Expandiendo registros a nivel de turno...")
+    
+    # Mapeo de días en español a inglés
+    dias_semana_map = {
+        'Lunes': 'Monday',
+        'Martes': 'Tuesday',
+        'Miercoles': 'Wednesday',
+        'Miércoles': 'Wednesday',
+        'Jueves': 'Thursday',
+        'Viernes': 'Friday',
+        'Sabado': 'Saturday',
+        'Sábado': 'Saturday',
+        'Domingo': 'Sunday'
+    }
+    
+    registros_expandidos = []
+    
+    # Iterar por cada camión en df_base
+    for camion in df_base['Camion'].unique():
+        # Obtener configuración de turnos del mantenedor
+        config_camion = df_mantenedor[df_mantenedor['Camion'] == camion]
+        
+        if config_camion.empty:
+            # Si no hay configuración, mantener el registro sin turno
+            df_camion = df_base[df_base['Camion'] == camion].copy()
+            df_camion['Turno'] = 'Sin Turno'
+            df_camion['Hora_inicio_turno'] = None
+            registros_expandidos.append(df_camion)
+            continue
+        
+        turnos_config = config_camion.iloc[0]['Turnos_parseados']
+        
+        if not turnos_config or len(turnos_config) == 0:
+            # Sin turnos configurados
+            df_camion = df_base[df_base['Camion'] == camion].copy()
+            df_camion['Turno'] = 'Sin Turno'
+            df_camion['Hora_inicio_turno'] = None
+            registros_expandidos.append(df_camion)
+            continue
+        
+        # Obtener datos del camión
+        df_camion = df_base[df_base['Camion'] == camion].copy()
+        
+        # Para cada fecha del camión
+        for _, row in df_camion.iterrows():
+            fecha = row['fecha_completa']
+            dia_semana = fecha.strftime('%A')  # Nombre del día en inglés
+            
+            # Encontrar qué turnos aplican a este día
+            turnos_del_dia = []
+            for turno_config in turnos_config:
+                # Verificar si este turno opera en este día de la semana
+                dias_turno_esp = turno_config['dias']
+                
+                # Convertir días del turno a inglés
+                dias_turno_ing = []
+                for dia_esp in dias_turno_esp:
+                    dia_esp_norm = dia_esp.strip()
+                    if dia_esp_norm in dias_semana_map:
+                        dias_turno_ing.append(dias_semana_map[dia_esp_norm])
+                
+                if dia_semana in dias_turno_ing:
+                    turnos_del_dia.append(turno_config)
+            
+            # Si hay turnos para este día, crear un registro por turno
+            if turnos_del_dia:
+                for turno_config in turnos_del_dia:
+                    registro_turno = row.copy()
+                    registro_turno['Turno'] = turno_config['turno_nombre']
+                    registro_turno['Hora_inicio_turno'] = turno_config['hora_inicio']
+                    registros_expandidos.append(pd.DataFrame([registro_turno]))
+            else:
+                # No hay turnos para este día, mantener sin turno
+                registro_sin_turno = row.copy()
+                registro_sin_turno['Turno'] = 'Sin Turno'
+                registro_sin_turno['Hora_inicio_turno'] = None
+                registros_expandidos.append(pd.DataFrame([registro_sin_turno]))
+    
+    if not registros_expandidos:
+        return df_base.copy()
+    
+    # Concatenar todos los registros
+    df_expandido = pd.concat(registros_expandidos, ignore_index=True)
+    
+    print(f"✅ Expansión completada: {len(df_base)} → {len(df_expandido)} registros")
+    
+    return df_expandido
+
+# ============================================
+# FUNCIÓN PRINCIPAL: OBTENER DATOS COMPLETOS CON TURNOS
+# ============================================
 @cache.memoize(timeout=900)  # Cache por 15 minutos
 def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
     """
-    Obtener datos completos integrando SCR, Turnos y RCO (similar al notebook)
-    NOTA: Esta función está cacheada por 15 minutos (hace 3 queries grandes)
+    Obtener datos completos integrando SCR, Turnos y RCO.
+    NUEVA VERSIÓN SIMPLIFICADA: Queries directas sin merges complejos.
+    
+    Estructura de retorno:
+        DataFrame con columnas:
+        - Camion
+        - Fecha
+        - fecha_completa
+        - Turno (ej: 'N/A' por ahora, sin granularidad de turno para evitar pérdida de datos)
+        - Entregado_totalmente
+        - En_ruta
+        - Planificado
+        - Turnos_enviados
+        - Conexion_RCO
+        - Transportista
+        - ¿Es licitado?
     """
-    print(f"🔄 [CACHE MISS] Ejecutando 3 queries completas para {minera_nombre} ({fecha_inicio} - {fecha_fin})")
+    print(f"🔄 [CACHE MISS] Ejecutando queries completas SIMPLIFICADAS para {minera_nombre} ({fecha_inicio} - {fecha_fin})")
     
     if not USE_ATHENA:
         return None
 
-    # 1. Obtener datos SCR (pedidos)
-    df_scr = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
-    if df_scr is None or df_scr.empty:
+    # Obtener flota licitada para la minera
+    df_flota = obtener_flota_licitada_athena(minera_nombre)
+    
+    if df_flota.empty:
+        print("⚠️ No se encontró flota licitada para esta minera")
         return None
-
-    # 2. Obtener turnos enviados
-    # OPTIMIZACIÓN: Seleccionar solo columnas necesarias y filtrar en query
+    
+    vehiculos_transportista = df_flota['codigo_tanque'].tolist()
+    print(f"📋 Total vehículos en flota: {len(vehiculos_transportista)}")
+    
+    # 1. QUERY TURNOS ENVIADOS (POR FECHA)
     query_turnos = f"""
-    SELECT 
-        id_turno_uuid,
-        estado,
-        id_vehiculo,
-        fecha_inicio_utc,
-        fecha_hora
-    FROM {DATABASE_DISPOMATE}.{TABLA_TURNOS}
-    WHERE DATE(fecha_inicio_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
-      AND DATE(fecha_inicio_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
-    ORDER BY fecha_inicio_utc
+    SELECT id_vehiculo, DATE(fecha_inicio_utc) as fecha, COUNT(DISTINCT id_turno_uuid) as turnos_enviados
+    FROM (
+        SELECT id_turno_uuid, id_vehiculo, estado, fecha_inicio_utc,
+               ROW_NUMBER() OVER (PARTITION BY id_turno_uuid ORDER BY fecha_hora DESC) as rn
+        FROM {DATABASE_DISPOMATE}.{TABLA_TURNOS}
+        WHERE DATE(fecha_inicio_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
+          AND DATE(fecha_inicio_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
+          AND id_vehiculo IN ({','.join(map(str, vehiculos_transportista))})
+    )
+    WHERE rn = 1 AND estado = 'ENVIADO'
+    GROUP BY id_vehiculo, DATE(fecha_inicio_utc)
     """
     
     try:
@@ -209,61 +468,682 @@ def obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin):
     except Exception as e:
         print(f"Error obteniendo turnos: {e}")
         df_turnos = pd.DataFrame()
-
-    # 3. Obtener conexiones RCO
-    # OPTIMIZACIÓN: Seleccionar solo columnas necesarias
+    
+    # 2. QUERY CONEXIONES RCO (CON FECHA Y HORA PARA ASIGNACIÓN DE TURNO)
     query_rco = f"""
     SELECT 
         codigo_tanque,
-        fecha_conexion_utc
+        DATE(fecha_conexion_utc) as fecha,
+        CAST(fecha_conexion_utc AS TIME) as hora,
+        COUNT(*) as conexiones_rco
     FROM {DATABASE_DISPOMATE}.{TABLA_RCO}
     WHERE DATE(fecha_conexion_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
       AND DATE(fecha_conexion_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
-    ORDER BY fecha_conexion_utc
+      AND codigo_tanque IN ({','.join(map(str, vehiculos_transportista))})
+    GROUP BY codigo_tanque, DATE(fecha_conexion_utc), CAST(fecha_conexion_utc AS TIME)
     """
     
     try:
         df_rco = sql_athena(query_rco)
+        if not df_rco.empty:
+            # Convertir fecha a datetime
+            df_rco['fecha'] = pd.to_datetime(df_rco['fecha']).dt.date
     except Exception as e:
         print(f"Error obteniendo RCO: {e}")
         df_rco = pd.DataFrame()
-
-    # 4. Procesar y combinar datos como en el notebook
-    resultado_completo = procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin, minera_nombre)
     
-    return resultado_completo
-
-
-def calcular_disponibilidad_operacional(datos_completos, banda_total=None):
+    # 3. QUERY ENTREGAS (CON FECHA Y HORA PARA ASIGNACIÓN DE TURNO)
+    query_entregas = f"""
+    SELECT 
+        CAST(vehiclereal AS INTEGER) as vehiclereal,
+        fechallegadaprog as fecha,
+        horallegadaprog as hora,
+        descrstatu as estado,
+        COUNT(*) as cantidad
+    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
+    WHERE fechallegadaprog >= '{fecha_inicio.strftime('%Y-%m-%d')}'
+      AND fechallegadaprog <= '{fecha_fin.strftime('%Y-%m-%d')}'
+      AND CAST(vehiclereal AS INTEGER) IN ({','.join(map(str, vehiculos_transportista))})
+    GROUP BY CAST(vehiclereal AS INTEGER), fechallegadaprog, horallegadaprog, descrstatu
     """
-    Calcular la Disponibilidad Operacional según nueva métrica:
     
-    Disponibilidad = (Entregas Exitosas) / (Banda Total del Transportista)
+    try:
+        df_entregas = sql_athena(query_entregas)
+        if not df_entregas.empty:
+            df_entregas['vehiclereal'] = df_entregas['vehiclereal'].astype(int)
+            # Convertir fecha a datetime
+            df_entregas['fecha'] = pd.to_datetime(df_entregas['fecha']).dt.date
+            print(f"📊 DEBUG ENTREGAS - Total registros: {len(df_entregas)}")
+            print(f"📊 DEBUG ENTREGAS - Fechas únicas: {sorted(df_entregas['fecha'].unique().tolist())}")
+            print(f"📊 DEBUG ENTREGAS - Estados únicos: {df_entregas['estado'].unique().tolist()}")
+            print(f"📊 DEBUG ENTREGAS - Camiones con entregas: {sorted(df_entregas['vehiclereal'].unique().tolist())}")
+            
+            # Contar por estado
+            print(f"📊 DEBUG ENTREGAS - Cantidad por estado:")
+            for estado in df_entregas['estado'].unique():
+                cant = df_entregas[df_entregas['estado'] == estado]['cantidad'].sum()
+                print(f"   {estado}: {cant}")
+            
+            print(f"📊 DEBUG ENTREGAS - Primeros 20 registros:")
+            print(df_entregas[['vehiclereal', 'fecha', 'hora', 'estado', 'cantidad']].head(20))
+        else:
+            print("⚠️ DEBUG ENTREGAS - DataFrame vacío")
+    except Exception as e:
+        print(f"Error obteniendo entregas: {e}")
+        df_entregas = pd.DataFrame()
     
-    Entregas Exitosas incluyen:
-    - Criterio A: Pedido fue entregado correctamente (Entregado_totalmente > 0)
-    - Criterio B: Pedido NO fue entregado PERO sí hubo conexión RCO (Entregado_totalmente == 0 AND Conexion_RCO > 0)
+    # 4. OBTENER CONFIGURACIÓN DE TURNOS
+    df_mantenedor = cargar_mantenedor_flota()
     
-    Definiciones técnicas:
-    - "Entregado Correctamente": Estado 'Entregado totalmente' o 'Recibí Conforme' en SCR
-    - "Conexiones al RCO": Registro de conexión operacional en tabla RCO (cualquier evento > 0)
-    - "Banda Total": Capacidad asignada al transportista (viajes programados por día)
+    # Función auxiliar para convertir a date de forma segura
+    def to_date(fecha_obj):
+        """Convierte datetime o date a date"""
+        if isinstance(fecha_obj, datetime):
+            return fecha_obj.date()
+        return fecha_obj  # Ya es date
     
-    Args:
-        datos_completos: DataFrame con columnas ['Turnos_enviados', 'Entregado_totalmente', 'Conexion_RCO', '¿Es licitado?']
-        banda_total: Banda total del transportista (capacidad asignada). Si es None, se usa turnos_enviados como fallback.
+    # Función auxiliar para asignar actividad a turno
+    def asignar_actividad_a_turno(hora_str, turnos_config):
+        """
+        Asigna una hora a un turno considerando turnos nocturnos que cruzan medianoche.
+        Lógica: 
+        - Si hora >= hora_inicio_turno_2 (ej: >= 19:00): Turno 2
+        - Si hora < hora_inicio_turno_1 (ej: < 07:00, madrugada): Turno 2 (continúa del día anterior)
+        - Resto: Turno 1
+        """
+        if not turnos_config or len(turnos_config) == 0:
+            return None
+        
+        if not hora_str:
+            return turnos_config[0]  # Si no hay hora, asignar al primer turno
+        
+        try:
+            # Convertir hora string a time
+            from datetime import datetime, time
+            hora_evento = datetime.strptime(str(hora_str), '%H:%M:%S').time()
+            
+            # Si solo hay un turno, asignarlo
+            if len(turnos_config) == 1:
+                return turnos_config[0]
+            
+            # Si hay dos turnos, aplicar lógica considerando turno nocturno
+            if len(turnos_config) >= 2:
+                segundo_turno_inicio = datetime.strptime(turnos_config[1]['turno_nombre'], '%H:%M').time()
+                primer_turno_inicio = datetime.strptime(turnos_config[0]['turno_nombre'], '%H:%M').time()
+                
+                # Si hora >= inicio turno 2 (ej: >= 19:00) → Turno 2
+                if hora_evento >= segundo_turno_inicio:
+                    return turnos_config[1]
+                
+                # Si hora < inicio turno 1 (ej: < 07:00, madrugada) → Turno 2 nocturno
+                elif hora_evento < primer_turno_inicio:
+                    return turnos_config[1]
+                
+                # Resto (ej: 07:00 - 18:59) → Turno 1
+                else:
+                    return turnos_config[0]
+        except:
+            return turnos_config[0]  # En caso de error, asignar al primer turno
+        
+        return turnos_config[0]
+    
+    # 5. OBTENER TODAS LAS FECHAS DEL RANGO
+    fechas_rango = []
+    fecha_actual = fecha_inicio
+    while fecha_actual <= fecha_fin:
+        fechas_rango.append(fecha_actual)
+        fecha_actual += timedelta(days=1)
+    
+    # 6. COMBINAR INFORMACIÓN - ITERAR POR FECHA Y VEHÍCULO
+    datos_completos_lista = []
+    
+    for fecha_proceso in fechas_rango:
+        for _, vehiculo in df_flota.iterrows():
+            codigo_tanque = int(vehiculo['codigo_tanque'])
+            
+            # Obtener configuración de turnos del vehículo
+            turnos_config = []
+            if not df_mantenedor.empty:
+                config_camion = df_mantenedor[df_mantenedor['Camion'] == codigo_tanque]
+                if not config_camion.empty:
+                    turnos_config = config_camion.iloc[0].get('Turnos_parseados', [])
+            
+            # Turnos enviados PARA ESTA FECHA
+            turnos_enviados_total = 0
+            if not df_turnos.empty and 'id_vehiculo' in df_turnos.columns and 'fecha' in df_turnos.columns:
+                turno_row = df_turnos[
+                    (df_turnos['id_vehiculo'] == codigo_tanque) &
+                    (df_turnos['fecha'] == fecha_proceso.strftime('%Y-%m-%d'))
+                ]
+                if not turno_row.empty:
+                    turnos_enviados_total = int(turno_row['turnos_enviados'].iloc[0])
+        
+            # Si no tiene configuración de turnos pero tiene actividad
+            if not turnos_config:
+                # Calcular totales sin separación por turno PARA ESTA FECHA
+                conexion_rco = 0
+                if not df_rco.empty and 'codigo_tanque' in df_rco.columns:
+                    rco_rows = df_rco[
+                        (df_rco['codigo_tanque'] == codigo_tanque) &
+                        (df_rco['fecha'] == to_date(fecha_proceso))
+                    ]
+                    if not rco_rows.empty:
+                        conexion_rco = int(rco_rows['conexiones_rco'].sum())
+                
+                entregado_totalmente = 0
+                en_ruta = 0
+                planificado = 0
+                
+                if not df_entregas.empty:
+                    entregas_vehiculo = df_entregas[
+                        (df_entregas['vehiclereal'] == codigo_tanque) &
+                        (df_entregas['fecha'] == to_date(fecha_proceso))
+                    ]
+                    
+                    # DEBUG para primer camión y primera fecha
+                    if codigo_tanque == 4427 and fecha_proceso.day == 1:
+                        print(f"\n🔍 DEBUG ENTREGA CAMION {codigo_tanque} - Fecha: {fecha_proceso}")
+                        print(f"   Registros encontrados: {len(entregas_vehiculo)}")
+                        if not entregas_vehiculo.empty:
+                            print(f"   Entregas: {entregas_vehiculo[['estado', 'cantidad']].to_dict('records')}")
+                    
+                    if not entregas_vehiculo.empty:
+                        entregas_completadas = entregas_vehiculo[
+                            entregas_vehiculo['estado'].isin(['Entregado totalmente', 'Recibí Conforme'])
+                        ]
+                        entregado_totalmente = int(entregas_completadas['cantidad'].sum()) if not entregas_completadas.empty else 0
+                        
+                        en_ruta_rows = entregas_vehiculo[entregas_vehiculo['estado'] == 'En Ruta']
+                        en_ruta = int(en_ruta_rows['cantidad'].sum()) if not en_ruta_rows.empty else 0
+                        
+                        planificado_rows = entregas_vehiculo[entregas_vehiculo['estado'] == 'Planificado']
+                        planificado = int(planificado_rows['cantidad'].sum()) if not planificado_rows.empty else 0
+                
+                if turnos_enviados_total > 0 or conexion_rco > 0 or entregado_totalmente > 0 or en_ruta > 0 or planificado > 0:
+                    datos_completos_lista.append({
+                        'Camion': codigo_tanque,
+                        'Fecha': fecha_proceso.strftime('%d-%b'),
+                        'fecha_completa': fecha_proceso,
+                        'Turno': 'N/A',
+                        'Hora_inicio_turno': None,
+                        'Entregado_totalmente': entregado_totalmente,
+                        'En_ruta': en_ruta,
+                        'Planificado': planificado,
+                        'Turnos_enviados': turnos_enviados_total,
+                        'Conexion_RCO': conexion_rco,
+                        'Transportista': vehiculo['nombre_transportista'],
+                        '¿Es licitado?': 'Si'
+                    })
+            else:
+                # Tiene configuración de turnos - crear un registro por turno
+                for turno_info in turnos_config:
+                    turno_nombre = turno_info.get('turno_nombre', 'N/A')
+                    
+                    # Filtrar RCO para este turno Y ESTA FECHA
+                    conexion_rco = 0
+                    if not df_rco.empty and 'codigo_tanque' in df_rco.columns:
+                        rco_vehiculo = df_rco[
+                            (df_rco['codigo_tanque'] == codigo_tanque) &
+                            (df_rco['fecha'] == to_date(fecha_proceso))
+                        ]
+                        
+                        # DEBUG para primer camión y primera fecha
+                        if codigo_tanque == 4427 and fecha_proceso.day == 2:
+                            print(f"\n🔍 DEBUG RCO FILTRO - Camión {codigo_tanque}, Fecha: {fecha_proceso} (tipo: {type(fecha_proceso)})")
+                            print(f"   Turno procesando: {turno_nombre}")
+                            print(f"   Total RCO en df_rco para este camión: {len(df_rco[df_rco['codigo_tanque'] == codigo_tanque])}")
+                            if not df_rco[df_rco['codigo_tanque'] == codigo_tanque].empty:
+                                print(f"   Fechas RCO camión: {df_rco[df_rco['codigo_tanque'] == codigo_tanque]['fecha'].unique()}")
+                                print(f"   Tipo fecha en df_rco: {type(df_rco[df_rco['codigo_tanque'] == codigo_tanque]['fecha'].iloc[0])}")
+                            print(f"   RCO después filtro fecha: {len(rco_vehiculo)}")
+                            if not rco_vehiculo.empty:
+                                print(f"   Datos RCO: {rco_vehiculo[['hora', 'conexiones_rco']].to_dict('records')}")
+                        
+                        for _, rco_row in rco_vehiculo.iterrows():
+                            turno_asignado = asignar_actividad_a_turno(rco_row.get('hora'), turnos_config)
+                            if turno_asignado and turno_asignado.get('turno_nombre') == turno_nombre:
+                                conexion_rco += int(rco_row['conexiones_rco'])
+                    
+                    # Filtrar entregas para este turno Y ESTA FECHA
+                    entregado_totalmente = 0
+                    en_ruta = 0
+                    planificado = 0
+                    
+                    if not df_entregas.empty:
+                        entregas_vehiculo = df_entregas[
+                            (df_entregas['vehiclereal'] == codigo_tanque) &
+                            (df_entregas['fecha'] == to_date(fecha_proceso))
+                        ]
+                        
+                        for _, entrega_row in entregas_vehiculo.iterrows():
+                            turno_asignado = asignar_actividad_a_turno(entrega_row.get('hora'), turnos_config)
+                            
+                            # DEBUG para primer camión y primera fecha con entregas
+                            if codigo_tanque == 4427 and fecha_proceso.day in [5, 12] and entrega_row.get('estado') == 'Entregado totalmente':
+                                print(f"\n🔍 DEBUG ASIGNACIÓN TURNO - Camión {codigo_tanque}, Fecha: {fecha_proceso}")
+                                print(f"   Hora entrega: {entrega_row.get('hora')}")
+                                print(f"   Estado: {entrega_row.get('estado')}")
+                                print(f"   Turnos config: {[(t['turno_nombre'], t.get('hora_inicio')) for t in turnos_config]}")
+                                print(f"   Turno asignado: {turno_asignado.get('turno_nombre') if turno_asignado else None}")
+                                print(f"   Turno actual procesando: {turno_nombre}")
+                                print(f"   ¿Match?: {turno_asignado and turno_asignado.get('turno_nombre') == turno_nombre}")
+                            
+                            if turno_asignado and turno_asignado.get('turno_nombre') == turno_nombre:
+                                cantidad = int(entrega_row['cantidad'])
+                                estado = entrega_row['estado']
+                                
+                                if estado in ['Entregado totalmente', 'Recibí Conforme']:
+                                    entregado_totalmente += cantidad
+                                elif estado == 'En Ruta':
+                                    en_ruta += cantidad
+                                elif estado == 'Planificado':
+                                    planificado += cantidad
+                    
+                    # Solo agregar este turno si tiene alguna actividad
+                    if turnos_enviados_total > 0 or conexion_rco > 0 or entregado_totalmente > 0 or en_ruta > 0 or planificado > 0:
+                        datos_completos_lista.append({
+                            'Camion': codigo_tanque,
+                            'Fecha': fecha_proceso.strftime('%d-%b'),
+                            'fecha_completa': fecha_proceso,
+                            'Turno': turno_nombre,
+                            'Hora_inicio_turno': turno_nombre,
+                            'Entregado_totalmente': entregado_totalmente,
+                            'En_ruta': en_ruta,
+                            'Planificado': planificado,
+                            'Turnos_enviados': turnos_enviados_total if turno_info == turnos_config[0] else 0,  # Solo mostrar en primer turno
+                            'Conexion_RCO': conexion_rco,
+                            'Transportista': vehiculo['nombre_transportista'],
+                            '¿Es licitado?': 'Si'
+                        })
+    
+    if not datos_completos_lista:
+        print("⚠️ No hay datos con actividad para esta fecha")
+        return None
+    
+    df_resultado = pd.DataFrame(datos_completos_lista)
+    print(f"✅ Datos completos: {len(df_resultado)} registros con actividad")
+    
+    return df_resultado
+
+
+@cache.memoize(timeout=900)
+def procesar_datos_completos_con_turnos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin, minera_nombre=None):
+    """
+    Procesar y combinar datos de SCR, Turnos y RCO.
+    NUEVA VERSIÓN: Granularidad a nivel de [Camión, Fecha, Turno]
     
     Returns:
-        dict con:
-            - entregas_exitosas_total: Total de entregas consideradas exitosas
-            - entregas_criterio_a: Entregas completadas correctamente
-            - entregas_criterio_b: Entregas fallidas pero con conexión RCO
-            - turnos_enviados_total: Total de turnos enviados
-            - banda_total: Banda total usada en el cálculo
-            - disponibilidad_porcentaje: Porcentaje de disponibilidad operacional
-            - entregas_licitadas: Total de entregas realizadas por flota licitada
-            - entregas_totales: Total de entregas (Entregado_totalmente > 0)
-            - disponibilidad_licitada_porcentaje: Porcentaje de entregas por flota licitada
+        DataFrame con estructura:
+        [Camion, Fecha, fecha_completa, Turno, Hora_inicio_turno,
+         Entregado_totalmente, En_ruta, Planificado, Turnos_enviados,
+         Conexion_RCO, Transportista, ¿Es licitado?]
+    """
+    print(f"🔄 [CACHE MISS] Procesando datos completos CON TURNOS para {minera_nombre}")
+    
+    # Cargar mantenedor al inicio para usarlo en asignación de turnos
+    df_mantenedor = cargar_mantenedor_flota()
+    
+    # Función para asignar turno basándose en la hora del evento
+    def asignar_turno_a_evento(hora_evento, camion, fecha_str, df_mantenedor_local):
+        """Asignar el turno correcto basándose en la hora del evento"""
+        if pd.isna(hora_evento) or hora_evento is None:
+            return 'Sin Turno'
+        
+        # Obtener configuración de turnos del camión
+        config_camion = df_mantenedor_local[df_mantenedor_local['Camion'] == camion]
+        if config_camion.empty:
+            return 'Sin Turno'
+        
+        turnos_config = config_camion.iloc[0]['Turnos_parseados']
+        if not turnos_config or len(turnos_config) == 0:
+            return 'Sin Turno'
+        
+        # Convertir hora_evento a objeto time si es string
+        if isinstance(hora_evento, str):
+            try:
+                hora_evento = datetime.strptime(hora_evento, '%H:%M:%S').time()
+            except:
+                return 'Sin Turno'
+        
+        # Buscar el turno que corresponde a esta hora
+        # Asumimos que un evento pertenece al turno si ocurrió después del inicio del turno
+        # y antes del inicio del siguiente turno (o fin del día)
+        turnos_con_hora = []
+        for turno in turnos_config:
+            try:
+                hora_inicio = datetime.strptime(turno['hora_inicio'], '%H:%M:%S').time()
+                turnos_con_hora.append({
+                    'nombre': turno['turno_nombre'],
+                    'hora_inicio': hora_inicio
+                })
+            except:
+                continue
+        
+        # Ordenar turnos por hora de inicio
+        turnos_con_hora.sort(key=lambda x: x['hora_inicio'])
+        
+        # Buscar en qué turno cae el evento
+        turno_asignado = 'Sin Turno'
+        for i, turno in enumerate(turnos_con_hora):
+            hora_inicio_turno = turno['hora_inicio']
+            
+            # Obtener hora fin del turno (inicio del siguiente turno o fin del día)
+            if i < len(turnos_con_hora) - 1:
+                hora_fin_turno = turnos_con_hora[i + 1]['hora_inicio']
+            else:
+                # Último turno del día, va hasta el inicio del primer turno del día siguiente
+                # Consideramos que va hasta las 23:59:59
+                hora_fin_turno = time(23, 59, 59)
+            
+            # Verificar si el evento cae en este turno
+            if hora_inicio_turno <= hora_evento < hora_fin_turno:
+                turno_asignado = turno['nombre']
+                break
+            
+            # Caso especial: si es el último turno y el evento es después de medianoche
+            # pero antes del primer turno del día
+            if i == len(turnos_con_hora) - 1 and hora_evento < turnos_con_hora[0]['hora_inicio']:
+                turno_asignado = turno['nombre']
+        
+        return turno_asignado
+    
+    # Obtener vehículos únicos del SCR
+    vehiculos_totales = df_scr['vehiclereal'].dropna()
+    vehiculos_numericos = pd.to_numeric(vehiculos_totales, errors='coerce')
+    vehiculos_validos = vehiculos_numericos[vehiculos_numericos > 0].astype(int).unique()
+    vehiculos_totales = np.sort(vehiculos_validos)
+    
+    # Obtener vehículos licitados
+    if minera_nombre:
+        vehiculos_licitados = obtener_vehiculos_licitados_por_minera(minera_nombre)
+    else:
+        vehiculos_licitados = [4002, 4003, 4049, 8054, 8120, 8348, 8820]
+    
+    # Crear tabla base: [Camión x Fecha]
+    fechas_rango = pd.date_range(start=fecha_inicio, end=fecha_fin, freq='D')
+    indices = list(itertools.product(vehiculos_totales, fechas_rango))
+    
+    tabla_base = pd.DataFrame(indices, columns=['Camion', 'fecha_completa'])
+    tabla_base['Fecha'] = tabla_base['fecha_completa'].dt.strftime('%d-%b')
+    tabla_base['fecha_para_merge'] = tabla_base['fecha_completa'].dt.date
+    tabla_base['Camion'] = tabla_base['Camion'].astype(int)
+    tabla_base['¿Es licitado?'] = np.where(tabla_base['Camion'].isin(vehiculos_licitados), 'Si', 'No')
+    
+    # NUEVA LÓGICA: Expandir a nivel de turnos
+    if not df_mantenedor.empty:
+        tabla_base_expandida = expandir_turnos_a_registros(tabla_base, df_mantenedor)
+    else:
+        print("⚠️ Mantenedor de flota no disponible, trabajando sin turnos")
+        tabla_base_expandida = tabla_base.copy()
+        tabla_base_expandida['Turno'] = 'Sin Turno'
+        tabla_base_expandida['Hora_inicio_turno'] = None
+    
+    # Procesar turnos enviados
+    if not df_turnos.empty:
+        estado_final = (
+            df_turnos.sort_values(['id_turno_uuid', 'fecha_hora'])
+                     .groupby('id_turno_uuid', as_index=False)
+                     .tail(1)[['id_turno_uuid', 'estado', 'id_vehiculo', 'fecha_inicio_utc']]
+        )
+        
+        enviados = estado_final[
+            (estado_final['estado'] == 'ENVIADO') &
+            (estado_final['id_vehiculo'].isin(vehiculos_totales))
+        ].copy()
+        
+        enviados['fecha'] = pd.to_datetime(enviados['fecha_inicio_utc']).dt.date
+        conteo_turnos = enviados.groupby(['id_vehiculo', 'fecha']).size().reset_index(name='Turnos_enviados')
+        
+        # Merge con tabla expandida
+        tabla_base_expandida = tabla_base_expandida.merge(
+            conteo_turnos,
+            left_on=['Camion', 'fecha_para_merge'],
+            right_on=['id_vehiculo', 'fecha'],
+            how='left'
+        )
+        tabla_base_expandida['Turnos_enviados'] = tabla_base_expandida['Turnos_enviados'].fillna(0).astype(int)
+        tabla_base_expandida = tabla_base_expandida.drop(columns=['fecha', 'id_vehiculo'], errors='ignore')
+    else:
+        tabla_base_expandida['Turnos_enviados'] = 0
+    
+    # Procesar conexiones RCO CON ASIGNACIÓN DE TURNO
+    if not df_rco.empty:
+        df_rco_filtrado = df_rco[df_rco['codigo_tanque'].isin(vehiculos_totales)].copy()
+        
+        df_rco_filtrado['fecha_conexion_utc'] = pd.to_datetime(df_rco_filtrado['fecha_conexion_utc'])
+        df_rco_filtrado['fecha_conexion_santiago'] = (
+            df_rco_filtrado['fecha_conexion_utc']
+            .dt.tz_localize('UTC')
+            .dt.tz_convert('America/Santiago')
+        )
+        
+        hora_corte = pd.Timestamp('23:30').time()
+        df_rco_filtrado['fecha_rco'] = df_rco_filtrado['fecha_conexion_santiago'].apply(
+            lambda x: (x + pd.Timedelta(days=1)).date()
+            if x.time() >= hora_corte
+            else x.date()
+        )
+        
+        # Obtener hora de conexión para asignar turno
+        df_rco_filtrado['hora_conexion'] = df_rco_filtrado['fecha_conexion_santiago'].dt.time
+        
+        # Asignar turno a cada conexión RCO
+        df_rco_filtrado['turno_asignado'] = df_rco_filtrado.apply(
+            lambda row: asignar_turno_a_evento(
+                row['hora_conexion'],
+                int(row['codigo_tanque']),
+                str(row['fecha_rco']),
+                df_mantenedor
+            ),
+            axis=1
+        )
+        
+        # Contar conexiones por [vehiculo, fecha, turno]
+        conteos_rco = (df_rco_filtrado
+                      .groupby(['codigo_tanque', 'fecha_rco', 'turno_asignado'])
+                      .size()
+                      .reset_index(name='Conexion_RCO'))
+        
+        # Merge con tabla expandida (ahora incluye turno)
+        tabla_base_expandida = tabla_base_expandida.merge(
+            conteos_rco,
+            left_on=['Camion', 'fecha_para_merge', 'Turno'],
+            right_on=['codigo_tanque', 'fecha_rco', 'turno_asignado'],
+            how='left'
+        )
+        tabla_base_expandida['Conexion_RCO'] = tabla_base_expandida['Conexion_RCO'].fillna(0).astype(int)
+        tabla_base_expandida = tabla_base_expandida.drop(columns=['fecha_rco', 'codigo_tanque', 'turno_asignado'], errors='ignore')
+    else:
+        tabla_base_expandida['Conexion_RCO'] = 0
+    
+    # Procesar datos SCR para estados CON ASIGNACIÓN DE TURNO
+    df_scr['fecha_corregida'] = pd.to_datetime(df_scr['fechallegadaprog']).dt.strftime('%Y-%m-%d')
+    
+    # Convertir hora de llegada para obtener la hora del evento
+    if 'horallegadaprog' in df_scr.columns:
+        # horallegadaprog puede venir como string HH:MM:SS o como datetime
+        df_scr['hora_evento'] = pd.to_datetime(df_scr['horallegadaprog'], format='%H:%M:%S', errors='coerce').dt.time
+    else:
+        df_scr['hora_evento'] = None
+    
+    # Asignar turno a cada registro SCR
+    df_scr['vehiclereal_num'] = pd.to_numeric(df_scr['vehiclereal'], errors='coerce').fillna(0).astype(int)
+    df_scr['turno_asignado'] = df_scr.apply(
+        lambda row: asignar_turno_a_evento(
+            row['hora_evento'], 
+            row['vehiclereal_num'], 
+            row['fecha_corregida'],
+            df_mantenedor
+        ),
+        axis=1
+    )
+    
+    # Contar eventos por [vehiculo, fecha, turno, estado]
+    conteos_scr = (df_scr
+                   .groupby(['vehiclereal_num', 'fecha_corregida', 'turno_asignado', 'descrstatu'])
+                   .size()
+                   .reset_index(name='cantidad'))
+    
+    # Crear pivot con turno incluido
+    pivot_scr = conteos_scr.pivot_table(
+        index=['vehiclereal_num', 'fecha_corregida', 'turno_asignado'], 
+        columns='descrstatu', 
+        values='cantidad', 
+        fill_value=0
+    ).reset_index()
+    
+    pivot_scr.columns.name = None
+    estados_esperados = ['En Ruta', 'Entregado totalmente', 'Planificado']
+    for estado in estados_esperados:
+        if estado not in pivot_scr.columns:
+            pivot_scr[estado] = 0
+    
+    # Obtener transportista (con turno)
+    carriers = (
+        df_scr[['vehiclereal_num', 'fecha_corregida', 'turno_asignado', 'carriername1']]
+        .dropna(subset=['carriername1'])
+        .drop_duplicates(subset=['vehiclereal_num', 'fecha_corregida', 'turno_asignado'])
+        .groupby(['vehiclereal_num', 'fecha_corregida', 'turno_asignado'], as_index=False).first()
+    )
+    
+    # Crear mapeo de transportista por camión desde el mantenedor (fallback)
+    transportista_por_camion = {}
+    if not df_mantenedor.empty:
+        for _, row in df_mantenedor.iterrows():
+            camion = row['Camion']
+            transportista = row.get('Transportista', 'SIN_INFORMACION')
+            transportista_por_camion[camion] = transportista
+    
+    tabla_base_expandida['fecha_merge_scr'] = tabla_base_expandida['fecha_completa'].dt.strftime('%Y-%m-%d')
+    
+    # IMPORTANTE: Identificar registros con actividad ANTES del merge con SCR
+    # para no perderlos en el filtro final
+    tiene_turnos_o_rco = (
+        (tabla_base_expandida.get('Turnos_enviados', pd.Series([0]*len(tabla_base_expandida))) > 0) |
+        (tabla_base_expandida.get('Conexion_RCO', pd.Series([0]*len(tabla_base_expandida))) > 0)
+    )
+    tabla_base_expandida['_tiene_actividad_previa'] = tiene_turnos_o_rco
+    
+    # Merge con datos SCR (ahora incluye turno en la join)
+    tabla_final = tabla_base_expandida.merge(
+        pivot_scr,
+        left_on=['Camion', 'fecha_merge_scr', 'Turno'],
+        right_on=['vehiclereal_num', 'fecha_corregida', 'turno_asignado'],
+        how='left'
+    )
+    
+    for estado in estados_esperados:
+        if estado in tabla_final.columns:
+            tabla_final[estado] = tabla_final[estado].fillna(0).astype(int)
+    
+    # Merge con transportistas (ahora incluye turno)
+    tabla_final = tabla_final.merge(
+        carriers,
+        left_on=['Camion', 'fecha_merge_scr', 'Turno'],
+        right_on=['vehiclereal_num', 'fecha_corregida', 'turno_asignado'],
+        how='left'
+    )
+    
+    tabla_final['Transportista'] = tabla_final.get('carriername1', pd.Series([None]*len(tabla_final)))
+    tabla_final['Transportista'] = tabla_final['Transportista'].replace('', pd.NA)
+    
+    # Prioridad 1: Transportista del SCR por camión (sin considerar turno, ya que puede no tener actividad en ese turno específico)
+    per_truck = carriers.groupby('vehiclereal_num', as_index=False)['carriername1'].first().set_index('vehiclereal_num')['carriername1'].to_dict()
+    tabla_final['Transportista'] = tabla_final['Transportista'].fillna(tabla_final['Camion'].map(per_truck))
+    
+    # Prioridad 2: Transportista del mantenedor (fallback para turnos sin actividad)
+    tabla_final['Transportista'] = tabla_final['Transportista'].fillna(tabla_final['Camion'].map(transportista_por_camion))
+    
+    # Último fallback
+    tabla_final['Transportista'] = tabla_final['Transportista'].fillna('SIN_INFORMACION').astype(str)
+    
+    # Limpiar columnas auxiliares
+    tabla_final = tabla_final.drop(['fecha_merge_scr', 'vehiclereal_num', 'fecha_corregida', 'turno_asignado', 'carriername1', 'fecha_para_merge'], axis=1, errors='ignore')
+    
+    # Renombrar columnas
+    tabla_final = tabla_final.rename(columns={
+        'En Ruta': 'En_ruta',
+        'Entregado totalmente': 'Entregado_totalmente',
+        'Turnos_enviados': 'Turnos_enviados'
+    })
+    
+    print(f"📊 DEBUG - Registros antes de filtrar: {len(tabla_final)}")
+    print(f"📊 DEBUG - Registros con Turnos_enviados > 0: {(tabla_final['Turnos_enviados'] > 0).sum() if 'Turnos_enviados' in tabla_final.columns else 0}")
+    print(f"📊 DEBUG - Registros con Conexion_RCO > 0: {(tabla_final['Conexion_RCO'] > 0).sum() if 'Conexion_RCO' in tabla_final.columns else 0}")
+    print(f"📊 DEBUG - Registros con Entregado_totalmente > 0: {(tabla_final['Entregado_totalmente'] > 0).sum() if 'Entregado_totalmente' in tabla_final.columns else 0}")
+    
+    # NO filtrar registros - mantener TODOS los que tienen cualquier actividad
+    # Esto incluye: Turnos_enviados > 0, Conexion_RCO > 0, o Entregado_totalmente > 0
+    
+    # Asegurar que las columnas existan antes de filtrar
+    for col in ['Turnos_enviados', 'Conexion_RCO', 'Entregado_totalmente', 'En_ruta', 'Planificado']:
+        if col not in tabla_final.columns:
+            tabla_final[col] = 0
+    
+    # Identificar registros con actividad (incluyendo la actividad previa al merge)
+    tiene_actividad = (
+        (tabla_final['Turnos_enviados'] > 0) |
+        (tabla_final['Conexion_RCO'] > 0) |
+        (tabla_final['Entregado_totalmente'] > 0) |
+        (tabla_final['En_ruta'] > 0) |
+        (tabla_final['Planificado'] > 0) |
+        tabla_final.get('_tiene_actividad_previa', False)  # Incluir registros que tenían actividad antes del merge
+    )
+    
+    print(f"📊 DEBUG - Registros con actividad (incluyendo previa): {tiene_actividad.sum()}")
+    print(f"📊 DEBUG - Registros con SIN_INFORMACION: {(tabla_final['Transportista'] == 'SIN_INFORMACION').sum()}")
+    
+    # Filtrar solo registros con actividad Y con transportista válido
+    tabla_final = tabla_final[
+        tiene_actividad & (tabla_final['Transportista'] != 'SIN_INFORMACION')
+    ]
+    
+    # Limpiar columna auxiliar
+    tabla_final = tabla_final.drop('_tiene_actividad_previa', axis=1, errors='ignore')
+    
+    print(f"✅ Registros finales después de filtrar por actividad: {len(tabla_final)}")
+    
+    # IMPORTANTE: Reorganizar columnas para que Turno esté en posición destacada
+    columnas_ordenadas = [
+        'Camion', 'Fecha', 'fecha_completa', 'Turno', 'Hora_inicio_turno',
+        'Entregado_totalmente', 'En_ruta', 'Planificado', 
+        'Turnos_enviados', 'Conexion_RCO',
+        'Transportista', '¿Es licitado?'
+    ]
+    
+    # Asegurar que todas las columnas existan
+    for col in columnas_ordenadas:
+        if col not in tabla_final.columns:
+            if col == 'Turno':
+                tabla_final[col] = 'Sin Turno'
+            elif col == 'Hora_inicio_turno':
+                tabla_final[col] = None
+            else:
+                tabla_final[col] = 0
+    
+    tabla_final = tabla_final[columnas_ordenadas]
+    
+    return tabla_final
+
+
+# ============================================
+# FUNCIÓN DE DISPONIBILIDAD (ACTUALIZADA PARA TURNOS)
+# ============================================
+def calcular_disponibilidad_operacional(datos_completos, banda_total=None):
+    """
+    Calcular la Disponibilidad Operacional.
+    ACTUALIZADO: Considera granularidad por turno.
+    
+    La disponibilidad se calcula a nivel de [Camión-Fecha-Turno]:
+    - Criterio A: Turno con entrega realizada
+    - Criterio B: Turno sin entrega PERO con conexión RCO
+    
+    Args:
+        datos_completos: DataFrame con columnas [..., Turno, ...]
+        banda_total: Banda total del transportista
+    
+    Returns:
+        dict con métricas de disponibilidad
     """
     if datos_completos is None or datos_completos.empty:
         return {
@@ -277,42 +1157,29 @@ def calcular_disponibilidad_operacional(datos_completos, banda_total=None):
             'disponibilidad_licitada_porcentaje': 0.0
         }
     
-    # Criterio A: Entregado correctamente
+    # Criterio A: Entregado correctamente (por turno)
     entregas_criterio_a = int(datos_completos['Entregado_totalmente'].sum())
     
-    # Criterio B: No entregado PERO con conexión RCO
-    # IMPORTANTE: Contar solo 1 por registro si hubo RCO (no sumar todas las conexiones)
-    # Identificar registros donde NO se entregó (Entregado_totalmente == 0) PERO hubo conexión RCO (Conexion_RCO > 0)
+    # Criterio B: No entregado PERO con conexión RCO (por turno)
     criterio_b_mask = (datos_completos['Entregado_totalmente'] == 0) & (datos_completos['Conexion_RCO'] > 0)
-    entregas_criterio_b = int(criterio_b_mask.sum())  # Cuenta 1 por cada registro que cumple la condición
+    entregas_criterio_b = int(criterio_b_mask.sum())
     
-    # Total de entregas exitosas (Criterio A ∪ Criterio B)
     entregas_exitosas_total = entregas_criterio_a + entregas_criterio_b
     
-    # Total de turnos enviados
     turnos_enviados_total = int(datos_completos['Turnos_enviados'].sum())
     
-    # Usar banda_total si está disponible, sino usar turnos_enviados como fallback
     denominador = banda_total if banda_total is not None and banda_total > 0 else turnos_enviados_total
     
-    # Calcular porcentaje de disponibilidad operacional
     if denominador > 0:
         disponibilidad_porcentaje = (entregas_exitosas_total / denominador) * 100
-        # IMPORTANTE: Limitar a 100% máximo
-        disponibilidad_porcentaje = min(disponibilidad_porcentaje, 100.0)
     else:
         disponibilidad_porcentaje = 0.0
     
-    # Calcular Disponibilidad Licitada
-    # Entregas totales: suma de todas las entregas completadas
     entregas_totales = int(datos_completos['Entregado_totalmente'].sum())
-    
-    # Entregas licitadas: suma de entregas completadas por flota licitada
     entregas_licitadas = int(
         datos_completos[datos_completos['¿Es licitado?'] == 'Si']['Entregado_totalmente'].sum()
     )
     
-    # Calcular porcentaje de disponibilidad licitada
     if entregas_totales > 0:
         disponibilidad_licitada_porcentaje = (entregas_licitadas / entregas_totales) * 100
     else:
@@ -331,208 +1198,13 @@ def calcular_disponibilidad_operacional(datos_completos, banda_total=None):
     }
 
 
-@cache.memoize(timeout=900)  # Cache por 15 minutos
-def procesar_datos_completos(df_scr, df_turnos, df_rco, fecha_inicio, fecha_fin, minera_nombre=None):
-    """
-    Procesar y combinar datos de SCR, Turnos y RCO (replicando lógica del notebook)
-    NOTA: Función cacheada para evitar reprocesamiento costoso
-    
-    Args:
-        df_scr: DataFrame con datos SCR
-        df_turnos: DataFrame con datos de turnos
-        df_rco: DataFrame con datos RCO
-        fecha_inicio: Fecha inicial del rango
-        fecha_fin: Fecha final del rango
-        minera_nombre: Nombre de la minera (opcional, para obtener flota licitada)
-    """
-    print(f"🔄 [CACHE MISS] Procesando datos completos para {minera_nombre}")
-    # Obtener vehículos únicos del SCR - filtrar solo valores numéricos válidos
-    # OPTIMIZACIÓN: Usar operaciones vectorizadas en lugar de loops
-    vehiculos_totales = df_scr['vehiclereal'].dropna()
-    
-    # Convertir a numérico de una vez (más rápido que loop)
-    vehiculos_numericos = pd.to_numeric(vehiculos_totales, errors='coerce')
-    vehiculos_validos = vehiculos_numericos[vehiculos_numericos > 0].astype(int).unique()
-    vehiculos_totales = np.sort(vehiculos_validos)
-    
-    # Obtener vehículos licitados desde la tabla de flota o usar lista por defecto
-    if minera_nombre:
-        vehiculos_licitados = obtener_vehiculos_licitados_por_minera(minera_nombre)
-    else:
-        # Fallback a lista hardcodeada
-        vehiculos_licitados = [4002, 4003, 4049, 8054, 8120, 8348, 8820]
-    
-    # Crear tabla base combinando todos los vehículos con todas las fechas
-    # OPTIMIZACIÓN: Usar producto cartesiano de pandas en lugar de loops
-    fechas_rango = pd.date_range(start=fecha_inicio, end=fecha_fin, freq='D')
-    
-    # Crear MultiIndex y convertir a DataFrame (más eficiente)
-    import itertools
-    indices = list(itertools.product(vehiculos_totales, fechas_rango))
-    
-    tabla_base = pd.DataFrame(indices, columns=['Camion', 'fecha_completa'])
-    tabla_base['Fecha'] = tabla_base['fecha_completa'].dt.strftime('%d-%b')
-    tabla_base['fecha_para_merge'] = tabla_base['fecha_completa'].dt.date
-    tabla_base['Camion'] = tabla_base['Camion'].astype(int)
-    tabla_base['¿Es licitado?'] = np.where(tabla_base['Camion'].isin(vehiculos_licitados), 'Si', 'No')
-    
-    # Procesar turnos enviados
-    if not df_turnos.empty:
-        # OPTIMIZACIÓN: Usar set_index para merges más rápidos
-        # Obtener estado final por turno
-        estado_final = (
-            df_turnos.sort_values(['id_turno_uuid', 'fecha_hora'])
-                     .groupby('id_turno_uuid', as_index=False)
-                     .tail(1)[['id_turno_uuid', 'estado', 'id_vehiculo', 'fecha_inicio_utc']]
-        )
-        
-        enviados = estado_final[
-            (estado_final['estado'] == 'ENVIADO') &
-            (estado_final['id_vehiculo'].isin(vehiculos_totales))
-        ].copy()
-        
-        enviados['fecha'] = pd.to_datetime(enviados['fecha_inicio_utc']).dt.date
-        conteo_turnos = enviados.groupby(['id_vehiculo', 'fecha']).size().reset_index(name='Turnos_enviados')
-        
-        # Merge con tabla base
-        tabla_base = tabla_base.merge(
-            conteo_turnos,
-            left_on=['Camion', 'fecha_para_merge'],
-            right_on=['id_vehiculo', 'fecha'],
-            how='left'
-        )
-        tabla_base['Turnos_enviados'] = tabla_base['Turnos_enviados'].fillna(0).astype(int)
-        tabla_base = tabla_base.drop(columns=['fecha', 'id_vehiculo'], errors='ignore')
-    else:
-        tabla_base['Turnos_enviados'] = 0
-    
-    # Procesar conexiones RCO
-    if not df_rco.empty:
-        # Filtrar solo vehículos que están en vehiculos_totales y crear copia explícita
-        df_rco_filtrado = df_rco[df_rco['codigo_tanque'].isin(vehiculos_totales)].copy()
-        
-        # Convertir fecha_conexion_utc a zona horaria de Santiago de Chile
-        df_rco_filtrado['fecha_conexion_utc'] = pd.to_datetime(df_rco_filtrado['fecha_conexion_utc'])
-        df_rco_filtrado['fecha_conexion_santiago'] = (
-            df_rco_filtrado['fecha_conexion_utc']
-            .dt.tz_localize('UTC')
-            .dt.tz_convert('America/Santiago')
-        )
-        
-        # Hora límite para contar conexión al día siguiente (23:30 por defecto)
-        # Si la hora es mayor o igual a 23:30, contar para el día siguiente
-        hora_corte = pd.Timestamp('23:30').time()
-        df_rco_filtrado['fecha_rco'] = df_rco_filtrado['fecha_conexion_santiago'].apply(
-            lambda x: (x + pd.Timedelta(days=1)).date()
-            if x.time() >= hora_corte
-            else x.date()
-        )
-        
-        conteos_rco = (df_rco_filtrado
-                      .groupby(['codigo_tanque', 'fecha_rco'])
-                      .size()
-                      .reset_index(name='Conexion_RCO'))
-        
-        # Merge con tabla base
-        tabla_base = tabla_base.merge(
-            conteos_rco,
-            left_on=['Camion', 'fecha_para_merge'],
-            right_on=['codigo_tanque', 'fecha_rco'],
-            how='left'
-        )
-        tabla_base['Conexion_RCO'] = tabla_base['Conexion_RCO'].fillna(0).astype(int)
-        tabla_base = tabla_base.drop(columns=['fecha_rco', 'codigo_tanque'], errors='ignore')
-    else:
-        tabla_base['Conexion_RCO'] = 0
-    
-    # Procesar datos SCR para estados
-    df_scr['fecha_corregida'] = pd.to_datetime(df_scr['vdatu']).dt.strftime('%Y-%m-%d')
-    
-    # Crear conteos por vehículo, fecha y estado
-    conteos_scr = (df_scr
-                   .groupby(['vehiclereal', 'fecha_corregida', 'descrstatu'])
-                   .size()
-                   .reset_index(name='cantidad'))
-    
-    # Crear tabla pivot para tener estados como columnas
-    pivot_scr = conteos_scr.pivot_table(
-        index=['vehiclereal', 'fecha_corregida'], 
-        columns='descrstatu', 
-        values='cantidad', 
-        fill_value=0
-    ).reset_index()
-    
-    # Limpiar nombres de columnas y asegurar que existan todas las columnas necesarias
-    pivot_scr.columns.name = None
-    estados_esperados = ['En Ruta', 'Entregado totalmente', 'Planificado']
-    for estado in estados_esperados:
-        if estado not in pivot_scr.columns:
-            pivot_scr[estado] = 0
-    
-    # Convertir vehiclereal a int (manejar strings con decimales)
-    pivot_scr['vehiclereal'] = pd.to_numeric(pivot_scr['vehiclereal'], errors='coerce').fillna(0).astype(int)
-    
-    # Obtener transportista por vehículo y fecha
-    carriers = (
-        df_scr[['vehiclereal', 'fecha_corregida', 'carriername1']]
-        .dropna(subset=['carriername1'])
-        .drop_duplicates(subset=['vehiclereal', 'fecha_corregida'])
-        .groupby(['vehiclereal', 'fecha_corregida'], as_index=False).first()
-    )
-    # Convertir vehiclereal a int (manejar strings con decimales)
-    carriers['vehiclereal'] = pd.to_numeric(carriers['vehiclereal'], errors='coerce').fillna(0).astype(int)
-    
-    # Crear fecha para merge - usar el año de fecha_completa en lugar de hardcodear
-    tabla_base['fecha_merge_scr'] = tabla_base['fecha_completa'].dt.strftime('%Y-%m-%d')
-    
-    # Merge con datos SCR
-    tabla_final = tabla_base.merge(
-        pivot_scr,
-        left_on=['Camion', 'fecha_merge_scr'],
-        right_on=['vehiclereal', 'fecha_corregida'],
-        how='left'
-    )
-    
-    # Rellenar NaN con 0 para los estados
-    for estado in estados_esperados:
-        if estado in tabla_final.columns:
-            tabla_final[estado] = tabla_final[estado].fillna(0).astype(int)
-    
-    # Merge con transportistas
-    tabla_final = tabla_final.merge(
-        carriers,
-        left_on=['Camion', 'fecha_merge_scr'],
-        right_on=['vehiclereal', 'fecha_corregida'],
-        how='left'
-    )
-    
-    # Procesar transportista
-    tabla_final['Transportista'] = tabla_final.get('carriername1', pd.Series([None]*len(tabla_final)))
-    tabla_final['Transportista'] = tabla_final['Transportista'].replace('', pd.NA)
-    
-    # Llenar transportista faltante con el más común por vehículo
-    per_truck = carriers.groupby('vehiclereal', as_index=False)['carriername1'].first().set_index('vehiclereal')['carriername1'].to_dict()
-    tabla_final['Transportista'] = tabla_final['Transportista'].fillna(tabla_final['Camion'].map(per_truck))
-    tabla_final['Transportista'] = tabla_final['Transportista'].fillna('SIN_INFORMACION').astype(str)
-    
-    # Limpiar columnas auxiliares
-    tabla_final = tabla_final.drop(['fecha_merge_scr', 'vehiclereal', 'fecha_corregida', 'carriername1', 'fecha_para_merge'], axis=1, errors='ignore')
-    
-    # Renombrar columnas para mayor claridad
-    tabla_final = tabla_final.rename(columns={
-        'En Ruta': 'En_ruta',
-        'Entregado totalmente': 'Entregado_totalmente',
-        'Turnos_enviados': 'Turnos_enviados'
-    })
-    
-    # Filtrar transportistas sin información
-    tabla_final = tabla_final[tabla_final['Transportista'] != 'SIN_INFORMACION']
-    
-    return tabla_final
+# ============================================
+# FUNCIONES AUXILIARES (COPIAR DEL ORIGINAL)
+# ============================================
+# NOTA: Las siguientes funciones se mantienen igual que en el original.
+# Solo se listan las firmas; debes copiar la implementación completa.
 
-
-# Funciones para obtener datos desde Athena
-@cache.memoize(timeout=900)  # Cache por 15 minutos (datos cambian poco)
+@cache.memoize(timeout=900)
 def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
     """
     Obtener datos desde Athena siguiendo la lógica de athena_test.py
@@ -552,17 +1224,18 @@ def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
             minera_safe = minera.replace("'", "''")
             conditions.append(f"vtext LIKE '{minera_safe}'")
         
-        # OPTIMIZACIÓN: Seleccionar solo columnas necesarias
+        # OPTIMIZACIÓN: Seleccionar solo columnas necesarias + hora para asignación de turno
         query = f"""
         SELECT 
-            vdatu,
+            fechallegadaprog,
             vtext,
             vehiclereal,
             carriername1,
-            descrstatu
+            descrstatu,
+            horallegadaprog
         FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
-        WHERE vdatu >= '{fecha_inicio.strftime('%Y-%m-%d')}'
-          AND vdatu <= '{fecha_fin.strftime('%Y-%m-%d')}'
+        WHERE fechallegadaprog >= '{fecha_inicio.strftime('%Y-%m-%d')}'
+          AND fechallegadaprog <= '{fecha_fin.strftime('%Y-%m-%d')}'
           AND ({' OR '.join(conditions)})
           AND carriername1 IS NOT NULL
           AND carriername1 != 'SIN_INFORMACION'
@@ -570,17 +1243,18 @@ def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
     else:
         # Caso normal para mineras individuales
         minera_safe = minera_nombre.replace("'", "''")
-        # OPTIMIZACIÓN: Seleccionar solo columnas necesarias
+        # OPTIMIZACIÓN: Seleccionar solo columnas necesarias + hora para asignación de turno
         query = f"""
         SELECT 
-            vdatu,
+            fechallegadaprog,
             vtext,
             vehiclereal,
             carriername1,
-            descrstatu
+            descrstatu,
+            horallegadaprog
         FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
-        WHERE vdatu >= '{fecha_inicio.strftime('%Y-%m-%d')}'
-          AND vdatu <= '{fecha_fin.strftime('%Y-%m-%d')}'
+        WHERE fechallegadaprog >= '{fecha_inicio.strftime('%Y-%m-%d')}'
+          AND fechallegadaprog <= '{fecha_fin.strftime('%Y-%m-%d')}'
           AND vtext LIKE '{minera_safe}'
           AND carriername1 IS NOT NULL
           AND carriername1 != 'SIN_INFORMACION'
@@ -592,7 +1266,7 @@ def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
             return None
 
         # Procesar datos según lógica de athena_test.py
-        df['Fecha'] = pd.to_datetime(df['vdatu'], format='%Y-%m-%d', errors='coerce')
+        df['Fecha'] = pd.to_datetime(df['fechallegadaprog'], format='%Y-%m-%d', errors='coerce')
 
         # Calcular entregas (descrstatu) - igual que en athena_test.py
         df['Entregado totalmente'] = (
@@ -617,27 +1291,23 @@ def obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin):
         return None
 
 
-def procesar_datos_athena(df, minimo_viajes, maximo_viajes):
+def obtener_vehiculos_licitados_por_minera(minera_nombre):
     """
-    Procesar DataFrame de Athena según lógica de athena_test.py
+    Obtener lista de códigos de vehículos licitados para una minera
+    
+    Args:
+        minera_nombre: Nombre de la minera
+    
+    Returns:
+        Lista de códigos de vehículos (int)
     """
-    # Crear tabla base - agregación por Fecha y Transportista
-    tabla_base = df.groupby(['Fecha', 'Transportista']).agg({
-        'Entregado totalmente': 'sum'
-    }).reset_index()
-
-    # Resumen diario
-    resumen_diario = tabla_base.groupby('Fecha').agg({
-        'Entregado totalmente': 'sum'
-    }).reset_index()
-
-    # Verificar si están en rango
-    resumen_diario['En_rango'] = (
-        (resumen_diario['Entregado totalmente'] >= minimo_viajes) &
-        (resumen_diario['Entregado totalmente'] <= maximo_viajes)
-    )
-
-    return tabla_base, resumen_diario
+    df_flota = obtener_flota_licitada_athena(minera_nombre)
+    
+    if df_flota.empty:
+        # Fallback a lista hardcodeada (mantener compatibilidad)
+        return [4002, 4003, 4049, 8054, 8120, 8348, 8820]
+    
+    return sorted(df_flota['codigo_tanque'].unique().tolist())
 
 
 @cache.cached(timeout=3600, key_prefix='mineras_athena')  # Cache por 1 hora
@@ -657,17 +1327,29 @@ def obtener_mineras_athena():
     ]
     return mineras_predefinidas
 
-
-@cache.cached(timeout=3600, key_prefix='mineras_codelco')  # Cache por 1 hora
-def obtener_mineras_codelco():
-    """Obtener lista de mineras que forman parte de CODELCO"""
-    return ['MINISTRO HALES', 'RADOMIRO TOMIC', 'CHUQUICAMATA', 'MINA GABY']
-
-
-def es_minera_codelco(minera_nombre):
-    """Verificar si una minera pertenece al grupo CODELCO"""
-    return minera_nombre in obtener_mineras_codelco()
-
+@cache.cached(timeout=1800, key_prefix='transportistas_global')  # Cache por 30 minutos
+def obtener_transportistas_global():
+    """Obtener transportistas únicos de la tabla completa (para administración)."""
+    if not USE_ATHENA:
+        return []
+    # OPTIMIZACIÓN: Agregar límite y filtro de SIN_INFORMACION en query
+    query = f"""
+    SELECT DISTINCT carriername1 as transportista 
+    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS} 
+    WHERE carriername1 IS NOT NULL 
+      AND carriername1 != 'SIN_INFORMACION'
+    ORDER BY transportista
+    """
+    try:
+        df = sql_athena(query)
+        if df.empty:
+            return []
+        # Filtrar 'SIN_INFORMACION' de la lista
+        transportistas = sorted(df['transportista'].dropna().unique().tolist())
+        return [t for t in transportistas if t != 'SIN_INFORMACION']
+    except Exception as e:
+        print(f"Error obteniendo transportistas desde Athena: {e}")
+        return []
 
 def obtener_mapeo_uso_mineras():
     """Obtener mapeo entre valores de 'uso' en tabla flota y nombres de mineras"""
@@ -686,10 +1368,10 @@ def obtener_mapeo_uso_mineras():
         'CODELCO ANDINA': 'ANDINA',
         'QUADRA': 'QUADRA SIERRA GORDA',
         'SALARES NORTE': 'SALARES NORTE',
-        'CANDELARIA': 'MINERA CANDELARIA'
+        'CANDELARIA': 'MINERA CANDELARIA',
+        'MEL': 'MINA LA ESCONDIDA'
     }
     return mapeo_uso
-
 
 @cache.memoize(timeout=600)  # Cache por 10 minutos con parámetros
 def obtener_flota_licitada_athena(minera_nombre):
@@ -949,196 +1631,6 @@ def obtener_flota_licitada_athena(minera_nombre):
         print(f"Error obteniendo flota licitada de Athena: {e}")
         return pd.DataFrame()
 
-
-def obtener_vehiculos_licitados_por_minera(minera_nombre):
-    """
-    Obtener lista de códigos de vehículos licitados para una minera
-    
-    Args:
-        minera_nombre: Nombre de la minera
-    
-    Returns:
-        Lista de códigos de vehículos (int)
-    """
-    df_flota = obtener_flota_licitada_athena(minera_nombre)
-    
-    if df_flota.empty:
-        # Fallback a lista hardcodeada (mantener compatibilidad)
-        return [4002, 4003, 4049, 8054, 8120, 8348, 8820]
-    
-    return sorted(df_flota['codigo_tanque'].unique().tolist())
-
-
-def obtener_actividad_flota_licitada(minera_nombre, fecha_inicio, fecha_fin):
-    """
-    Obtener actividad detallada de cada vehículo de la flota licitada
-    
-    Args:
-        minera_nombre: Nombre de la minera
-        fecha_inicio: Fecha inicial del rango
-        fecha_fin: Fecha final del rango
-    
-    Returns:
-        Lista de diccionarios con actividad de cada vehículo:
-        - codigo_tanque: ID del vehículo
-        - nombre_transportista: Transportista del vehículo
-        - estado: Estado del vehículo en flota
-        - uso: Uso asignado
-        - turnos_enviados: Total de turnos enviados
-        - conexiones_rco: Total de conexiones RCO
-        - entregas_realizadas: Total de entregas completadas
-        - destinos: Lista de destinos únicos de entregas (vtext)
-        - detalle_entregas: Lista de entregas con destino y estado
-    """
-    if not USE_ATHENA:
-        return []
-    
-    # 1. Obtener flota licitada
-    df_flota = obtener_flota_licitada_athena(minera_nombre)
-    if df_flota.empty:
-        return []
-    
-    vehiculos_licitados = df_flota['codigo_tanque'].tolist()
-    
-    # 2. Obtener turnos enviados para estos vehículos
-    query_turnos = f"""
-    SELECT id_vehiculo, COUNT(DISTINCT id_turno_uuid) as turnos_enviados
-    FROM (
-        SELECT id_turno_uuid, id_vehiculo, estado,
-               ROW_NUMBER() OVER (PARTITION BY id_turno_uuid ORDER BY fecha_hora DESC) as rn
-        FROM {DATABASE_DISPOMATE}.{TABLA_TURNOS}
-        WHERE DATE(fecha_inicio_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
-          AND DATE(fecha_inicio_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
-          AND id_vehiculo IN ({','.join(map(str, vehiculos_licitados))})
-    )
-    WHERE rn = 1 AND estado = 'ENVIADO'
-    GROUP BY id_vehiculo
-    """
-    
-    try:
-        df_turnos = sql_athena(query_turnos)
-    except Exception as e:
-        print(f"Error obteniendo turnos de flota licitada: {e}")
-        df_turnos = pd.DataFrame()
-    
-    # 3. Obtener conexiones RCO para estos vehículos
-    query_rco = f"""
-    SELECT codigo_tanque, COUNT(*) as conexiones_rco
-    FROM {DATABASE_DISPOMATE}.{TABLA_RCO}
-    WHERE DATE(fecha_conexion_utc) >= DATE('{fecha_inicio.strftime('%Y-%m-%d')}')
-      AND DATE(fecha_conexion_utc) <= DATE('{fecha_fin.strftime('%Y-%m-%d')}')
-      AND codigo_tanque IN ({','.join(map(str, vehiculos_licitados))})
-    GROUP BY codigo_tanque
-    """
-    
-    try:
-        df_rco = sql_athena(query_rco)
-    except Exception as e:
-        print(f"Error obteniendo conexiones RCO de flota licitada: {e}")
-        df_rco = pd.DataFrame()
-    
-    # 4. Obtener entregas/pedidos con destinos para estos vehículos
-    query_entregas = f"""
-    SELECT 
-        CAST(vehiclereal AS INTEGER) as vehiclereal,
-        vtext as destino,
-        descrstatu as estado,
-        COUNT(*) as cantidad
-    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
-    WHERE vdatu >= '{fecha_inicio.strftime('%Y-%m-%d')}'
-      AND vdatu <= '{fecha_fin.strftime('%Y-%m-%d')}'
-      AND CAST(vehiclereal AS INTEGER) IN ({','.join(map(str, vehiculos_licitados))})
-    GROUP BY CAST(vehiclereal AS INTEGER), vtext, descrstatu
-    """
-    
-    try:
-        df_entregas = sql_athena(query_entregas)
-        if not df_entregas.empty:
-            df_entregas['vehiclereal'] = df_entregas['vehiclereal'].astype(int)
-    except Exception as e:
-        print(f"Error obteniendo entregas de flota licitada: {e}")
-        df_entregas = pd.DataFrame()
-    
-    # 5. Combinar toda la información
-    actividad_flota = []
-    
-    for _, vehiculo in df_flota.iterrows():
-        codigo_tanque = int(vehiculo['codigo_tanque'])
-        
-        # Turnos enviados
-        turnos = 0
-        if not df_turnos.empty and 'id_vehiculo' in df_turnos.columns:
-            turno_row = df_turnos[df_turnos['id_vehiculo'] == codigo_tanque]
-            if not turno_row.empty:
-                turnos = int(turno_row['turnos_enviados'].iloc[0])
-        
-        # Conexiones RCO
-        conexiones = 0
-        if not df_rco.empty and 'codigo_tanque' in df_rco.columns:
-            rco_row = df_rco[df_rco['codigo_tanque'] == codigo_tanque]
-            if not rco_row.empty:
-                conexiones = int(rco_row['conexiones_rco'].iloc[0])
-        
-        # Entregas y destinos
-        entregas_totales = 0
-        destinos = []
-        detalle_entregas = []
-        
-        if not df_entregas.empty:
-            entregas_vehiculo = df_entregas[df_entregas['vehiclereal'] == codigo_tanque]
-            
-            if not entregas_vehiculo.empty:
-                # Contar entregas completadas
-                entregas_completadas = entregas_vehiculo[
-                    entregas_vehiculo['estado'].isin(['Entregado totalmente', 'Recibí Conforme'])
-                ]
-                entregas_totales = int(entregas_completadas['cantidad'].sum()) if not entregas_completadas.empty else 0
-                
-                # Obtener destinos únicos
-                destinos = entregas_vehiculo['destino'].unique().tolist()
-                
-                # Detalle de entregas por destino y estado
-                for _, entrega in entregas_vehiculo.iterrows():
-                    detalle_entregas.append({
-                        'destino': entrega['destino'],
-                        'estado': entrega['estado'],
-                        'cantidad': int(entrega['cantidad'])
-                    })
-        
-        actividad_flota.append({
-            'codigo_tanque': codigo_tanque,
-            'nombre_transportista': vehiculo['nombre_transportista'],
-            'estado': 'Activo',  # Todos están activos en el Excel nuevo
-            'uso': vehiculo['uso'],
-            'turnos_enviados': turnos,
-            'conexiones_rco': conexiones,
-            'entregas_realizadas': entregas_totales,
-            'destinos': destinos,
-            'destinos_str': ', '.join(destinos) if destinos else 'Sin entregas',
-            'detalle_entregas': detalle_entregas,
-            'tiene_actividad': turnos > 0 or conexiones > 0 or entregas_totales > 0
-        })
-    
-    return actividad_flota
-
-
-@cache.cached(timeout=3600, key_prefix='config_viajes')  # Cache por 1 hora
-def obtener_configuracion_viajes():
-    """Obtener configuración de bandas mínimas y máximas de viajes por minera"""
-    configuracion_viajes = {
-        'MINA LA ESCONDIDA': {'minimo': 38, 'maximo': 38},
-        'QUADRA SIERRA GORDA': {'minimo': 11, 'maximo': 13}, 
-        'ANDINA': {'minimo': 6, 'maximo': 7},
-        'EL TENIENTE': {'minimo': 3, 'maximo': 4},
-        'CASERONES': {'minimo': 5, 'maximo': 6},
-        'SALARES NORTE': {'minimo': 4, 'maximo': 5},
-        'MINERA CANDELARIA': {'minimo': 9, 'maximo': 9},
-        'LOS BRONCES': {'minimo': 12, 'maximo': 12},
-        'CODELCO': {'minimo': 36, 'maximo': 42}  
-    }
-    return configuracion_viajes
-
-
 @cache.cached(timeout=3600, key_prefix='config_bandas')  # Cache por 1 hora
 def obtener_configuracion_bandas_transportista():
     """Obtener configuración de bandas de capacidad por transportista"""
@@ -1188,23 +1680,45 @@ def obtener_transportistas_autorizados(minera):
 
 
 def es_transportista_autorizado(transportista, minera):
-    """Verificar si un transportista está autorizado para una minera"""
+    """Verificar si un transportista está autorizado para una minera usando palabras clave"""
     transportistas_autorizados = obtener_transportistas_autorizados(minera)
     
     # Normalizar nombre del transportista para búsqueda
     transportista_normalizado = transportista.upper().strip()
     
-    # Buscar exacto
+    # Palabras clave para identificar transportistas (ignorando variaciones de "SOCIEDAD", "DE", "TRANSPORTES", etc.)
+    palabras_clave_transportistas = {
+        'ILZAUSPE': ['ILZAUSPE'],
+        'NAZAR': ['NAZAR'],
+        'COMBUSTIBLES CHILE': ['COMBUSTIBLES', 'CHILE'],
+        'SOLUCIONES LOGISTICAS': ['SOLUCIONES', 'LOGISTICAS'],
+        'SOTRASER': ['SOTRASER'],
+        'VIGAL': ['VIGAL'],
+    }
+    
+    # Para cada transportista autorizado, extraer palabras clave
+    for nombre_autorizado in transportistas_autorizados:
+        nombre_autorizado_upper = nombre_autorizado.upper()
+        
+        # Buscar si alguna palabra clave del transportista autorizado está en el nombre del DB
+        for clave, palabras in palabras_clave_transportistas.items():
+            # Si el nombre autorizado contiene la clave
+            if any(palabra in nombre_autorizado_upper for palabra in palabras):
+                # Y el nombre del DB también contiene todas las palabras de la clave
+                if all(palabra in transportista_normalizado for palabra in palabras):
+                    return True
+    
+    # Fallback: buscar exacto o parcial (compatibilidad con casos no cubiertos por palabras clave)
     if transportista_normalizado in [t.upper() for t in transportistas_autorizados]:
         return True
     
-    # Buscar por patrones parciales
     for nombre_autorizado in transportistas_autorizados:
         if (nombre_autorizado.upper() in transportista_normalizado or 
             transportista_normalizado in nombre_autorizado.upper()):
             return True
     
     return False
+
 
 
 def calcular_banda_transportista(transportista, minera, bandas_config=None):
@@ -1219,45 +1733,126 @@ def calcular_banda_transportista(transportista, minera, bandas_config=None):
     # Normalizar nombre del transportista para búsqueda
     transportista_normalizado = transportista.upper().strip()
     
-    # Buscar configuración específica del transportista (exacta)
+    # Palabras clave para identificar transportistas
+    palabras_clave_transportistas = {
+        'ILZAUSPE': ['ILZAUSPE'],
+        'NAZAR': ['NAZAR'],
+        'COMBUSTIBLES CHILE': ['COMBUSTIBLES', 'CHILE'],
+        'SOLUCIONES LOGISTICAS': ['SOLUCIONES', 'LOGISTICAS'],
+        'SOTRASER': ['SOTRASER'],
+        'VIGAL': ['VIGAL'],
+    }
+    
+    # Buscar configuración específica del transportista usando palabras clave
     for nombre_config, mineras_config in bandas_config.items():
         if minera in mineras_config:
-            if (transportista_normalizado == nombre_config.upper() or
-                nombre_config.upper() in transportista_normalizado or 
-                transportista_normalizado in nombre_config.upper()):
+            nombre_config_upper = nombre_config.upper()
+            
+            # Buscar por palabras clave
+            for clave, palabras in palabras_clave_transportistas.items():
+                # Si el nombre configurado contiene la clave
+                if any(palabra in nombre_config_upper for palabra in palabras):
+                    # Y el nombre del DB también contiene todas las palabras de la clave
+                    if all(palabra in transportista_normalizado for palabra in palabras):
+                        return mineras_config[minera]
+            
+            # Fallback: match exacto o parcial
+            if (transportista_normalizado == nombre_config_upper or
+                nombre_config_upper in transportista_normalizado or 
+                transportista_normalizado in nombre_config_upper):
                 return mineras_config[minera]
     
     # Si llegamos aquí, es un error en la configuración
     return None
 
 
-def obtener_transportistas_athena(minera_nombre, fecha_inicio, fecha_fin):
-    """Obtener transportistas únicos para una minera y rango de fechas"""
-    df = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
-    if df is None or df.empty:
-        return []
-    # Ya filtrado en obtener_datos_desde_athena, pero por seguridad adicional
-    transportistas = sorted(df['Transportista'].unique().tolist())
-    return [t for t in transportistas if t != 'SIN_INFORMACION']
+@cache.cached(timeout=3600, key_prefix='config_viajes')  # Cache por 1 hora
+def obtener_configuracion_viajes():
+    """Obtener configuración de bandas mínimas y máximas de viajes por minera"""
+    configuracion_viajes = {
+        'MINA LA ESCONDIDA': {'minimo': 38, 'maximo': 38},
+        'QUADRA SIERRA GORDA': {'minimo': 11, 'maximo': 13}, 
+        'ANDINA': {'minimo': 6, 'maximo': 7},
+        'EL TENIENTE': {'minimo': 3, 'maximo': 4},
+        'CASERONES': {'minimo': 5, 'maximo': 6},
+        'SALARES NORTE': {'minimo': 4, 'maximo': 5},
+        'MINERA CANDELARIA': {'minimo': 9, 'maximo': 9},
+        'LOS BRONCES': {'minimo': 12, 'maximo': 12},
+        'CODELCO': {'minimo': 36, 'maximo': 42}  
+    }
+    return configuracion_viajes
 
+@cache.cached(timeout=3600, key_prefix='mineras_codelco')  # Cache por 1 hora
+def obtener_mineras_codelco():
+    """Obtener lista de mineras que forman parte de CODELCO"""
+    return ['MINISTRO HALES', 'RADOMIRO TOMIC', 'CHUQUICAMATA', 'MINA GABY']
 
-@cache.memoize(timeout=900)  # Cache por 15 minutos
 def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max):
-    """Obtener datos para gráfico con cache"""
-    print(f"🔄 [CACHE MISS] Generando datos de gráfico para {minera_nombre}")
-    df = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
-    if df is None or df.empty:
-        return {'datos': [], 'minimo': viajes_min, 'maximo': viajes_max, 'tipo': 'apilado', 'transportistas': []}
-
-    tabla_base, resumen_diario = procesar_datos_athena(df, viajes_min, viajes_max)
-
+    """
+    Obtener datos para el gráfico de disponibilidad por transportista.
+    
+    REFACTORIZADA: Usa datos cacheados en lugar de queries directas.
+    
+    Args:
+        minera_nombre: Nombre de la minera
+        fecha_inicio: Fecha de inicio (datetime.date o datetime)
+        fecha_fin: Fecha de fin (datetime.date o datetime)
+        viajes_min: Umbral mínimo de viajes
+        viajes_max: Umbral máximo de viajes
+    
+    Returns:
+        dict: Diccionario con estructura:
+        {
+            'datos': [
+                {
+                    'fecha': 'DD-MM',
+                    'TransportistaA': X,
+                    'TransportistaB': Y,
+                    'total': Z,
+                    'cumple': True/False
+                },
+                ...
+            ],
+            'transportistas': ['TransportistaA', 'TransportistaB', ...],
+            'minimo': viajes_min,
+            'maximo': viajes_max,
+            'tipo': 'apilado'
+        }
+    """
+    print(f"📊 [GRAFICO] Obteniendo datos para {minera_nombre} ({fecha_inicio} - {fecha_fin})")
+    
+    # OPTIMIZACIÓN: Usar función cacheada en lugar de query directa
+    datos_completos = obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin)
+    
+    if datos_completos is None or datos_completos.empty:
+        return {
+            'datos': [],
+            'minimo': viajes_min,
+            'maximo': viajes_max,
+            'tipo': 'apilado',
+            'transportistas': []
+        }
+    
+    # Agrupar por Transportista, Camión y Fecha (sumar turnos del mismo día)
+    datos_agregados = datos_completos.groupby(['Transportista', 'Camion', 'fecha_completa']).agg({
+        'Entregado_totalmente': 'sum',  # Suma de entregas de todos los turnos
+    }).reset_index()
+    
     # Separar transportistas autorizados y otros
-    transportistas_unicos = tabla_base['Transportista'].unique()
+    transportistas_unicos = datos_agregados['Transportista'].unique()
+    print(f"🚛 DEBUG - Transportistas únicos encontrados: {transportistas_unicos.tolist()}")
+    
+    transportistas_autorizados_config = obtener_transportistas_autorizados(minera_nombre)
+    print(f"🚛 DEBUG - Transportistas autorizados configurados: {transportistas_autorizados_config}")
+    
     transportistas_autorizados = []
     otros_transportistas = []
     
     for transportista in transportistas_unicos:
-        if es_transportista_autorizado(transportista, minera_nombre):
+        es_autorizado = es_transportista_autorizado(transportista, minera_nombre)
+        print(f"🚛 DEBUG - '{transportista}' autorizado: {es_autorizado}")
+        
+        if es_autorizado:
             transportistas_autorizados.append(transportista)
         else:
             otros_transportistas.append(transportista)
@@ -1268,7 +1863,7 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
         transportistas_finales.append('OTRO TRANSPORTISTA')
     
     # Crear estructura para gráfico apilado
-    fechas_ordenadas = sorted(tabla_base['Fecha'].unique())
+    fechas_ordenadas = sorted(datos_agregados['fecha_completa'].unique())
     
     datos_apilados = []
     for fecha in fechas_ordenadas:
@@ -1277,11 +1872,11 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
         
         # Agregar datos por transportista autorizado
         for transportista in transportistas_autorizados:
-            datos_transportista = tabla_base[
-                (tabla_base['Fecha'] == fecha) & 
-                (tabla_base['Transportista'] == transportista)
+            datos_transportista = datos_agregados[
+                (datos_agregados['fecha_completa'] == fecha) & 
+                (datos_agregados['Transportista'] == transportista)
             ]
-            cantidad = int(datos_transportista['Entregado totalmente'].sum()) if not datos_transportista.empty else 0
+            cantidad = int(datos_transportista['Entregado_totalmente'].sum()) if not datos_transportista.empty else 0
             datos_fecha[transportista] = cantidad
             datos_fecha['total'] += cantidad
         
@@ -1289,11 +1884,11 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
         if otros_transportistas:
             cantidad_otros = 0
             for transportista in otros_transportistas:
-                datos_transportista = tabla_base[
-                    (tabla_base['Fecha'] == fecha) & 
-                    (tabla_base['Transportista'] == transportista)
+                datos_transportista = datos_agregados[
+                    (datos_agregados['fecha_completa'] == fecha) & 
+                    (datos_agregados['Transportista'] == transportista)
                 ]
-                cantidad_otros += int(datos_transportista['Entregado totalmente'].sum()) if not datos_transportista.empty else 0
+                cantidad_otros += int(datos_transportista['Entregado_totalmente'].sum()) if not datos_transportista.empty else 0
             
             datos_fecha['OTRO TRANSPORTISTA'] = cantidad_otros
             datos_fecha['total'] += cantidad_otros
@@ -1301,7 +1896,7 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
         # Verificar si cumple con el rango
         datos_fecha['cumple'] = viajes_min <= datos_fecha['total'] <= viajes_max
         datos_apilados.append(datos_fecha)
-
+    
     grafico_data = {
         'datos': datos_apilados,
         'minimo': viajes_min,
@@ -1309,509 +1904,202 @@ def obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_
         'tipo': 'apilado',
         'transportistas': transportistas_finales
     }
-
+    
+    print(f"✅ [GRAFICO] Datos procesados: {len(datos_apilados)} días, {len(transportistas_finales)} transportistas")
+    
     return grafico_data
 
-
-@cache.memoize(timeout=900)  # Cache por 15 minutos
 def obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max):
-    """Obtener datos para matriz con cache"""
-    print(f"🔄 [CACHE MISS] Generando matriz de datos para {minera_nombre}")
-    df = obtener_datos_desde_athena(minera_nombre, fecha_inicio, fecha_fin)
-    if df is None or df.empty:
-        return {'transportistas': [], 'fechas': [], 'datos': {}}
-
-    tabla_base, resumen_diario = procesar_datos_athena(df, viajes_min, viajes_max)
-
-    # Obtener datos completos para cálculos de disponibilidad operacional
+    """
+    Obtener datos para la matriz de disponibilidad (transportistas x fechas).
+    
+    REFACTORIZADA: Usa datos cacheados en lugar de queries directas.
+    
+    Args:
+        minera_nombre: Nombre de la minera
+        fecha_inicio: Fecha de inicio (datetime.date o datetime)
+        fecha_fin: Fecha de fin (datetime.date o datetime)
+        viajes_min: Umbral mínimo de viajes
+        viajes_max: Umbral máximo de viajes
+    
+    Returns:
+        dict: Diccionario con estructura:
+        {
+            'transportistas': ['TransportistaA', 'TransportistaB', ...],
+            'fechas': ['DD-MM', 'DD-MM', ...],
+            'datos': {
+                'TransportistaA': {
+                    'DD-MM': {
+                        'porcentaje': X,
+                        'total': Y,
+                        'banda': Z,
+                        'fecha_full': 'YYYY-MM-DD',
+                        'disponibilidad_operacional': {...},
+                        'entregas_licitadas': N,
+                        'entregas_totales': M
+                    }
+                }
+            },
+            'bandas_transportistas': {...}
+        }
+    """
+    print(f"🔲 [MATRIZ] Obteniendo datos para {minera_nombre} ({fecha_inicio} - {fecha_fin})")
+    
+    # OPTIMIZACIÓN: Usar función cacheada
     datos_completos = obtener_datos_completos_athena(minera_nombre, fecha_inicio, fecha_fin)
     
+    if datos_completos is None or datos_completos.empty:
+        return {
+            'transportistas': [],
+            'fechas': [],
+            'datos': {},
+            'bandas_transportistas': {}
+        }
+    
+    # Agrupar datos por Transportista, Camión y Fecha (sumar turnos del mismo día)
+    datos_agregados = datos_completos.groupby(['Transportista', 'Camion', 'fecha_completa']).agg({
+        'Entregado_totalmente': 'sum',
+        'Conexion_RCO': 'sum',
+        'Turnos_enviados': 'sum'
+    }).reset_index()
+    
     # Separar transportistas autorizados y otros
-    transportistas_unicos = tabla_base['Transportista'].unique()
+    transportistas_unicos = datos_agregados['Transportista'].unique()
     transportistas_autorizados = []
-    otros_transportistas_data = tabla_base[tabla_base['Transportista'].isin([])].copy()  # Inicializar vacío
+    otros_transportistas_data = []
     
     for transportista in transportistas_unicos:
         if es_transportista_autorizado(transportista, minera_nombre):
             transportistas_autorizados.append(transportista)
         else:
-            # Agregar a "otros" transportistas
-            datos_transportista = tabla_base[tabla_base['Transportista'] == transportista]
-            otros_transportistas_data = pd.concat([otros_transportistas_data, datos_transportista], ignore_index=True)
+            otros_data = datos_agregados[datos_agregados['Transportista'] == transportista]
+            otros_transportistas_data.append(otros_data)
     
     # Lista final de transportistas para mostrar
-    transportistas_finales = transportistas_autorizados.copy()
-    if not otros_transportistas_data.empty:
+    transportistas_finales = sorted(transportistas_autorizados)
+    if otros_transportistas_data:
         transportistas_finales.append('OTRO TRANSPORTISTA')
     
-    fechas = [d.strftime('%d-%m') for d in sorted(resumen_diario['Fecha'].unique())]
-
+    # Obtener fechas únicas y ordenadas
+    fechas_completas = sorted(datos_agregados['fecha_completa'].unique())
+    fechas = [d.strftime('%d-%m') for d in fechas_completas]
+    
     matriz_data = {
         'transportistas': transportistas_finales,
         'fechas': fechas,
         'datos': {},
-        'bandas_transportistas': {}  # Para referencia en el frontend
+        'bandas_transportistas': {}
     }
-
+    
     # Procesar transportistas autorizados
     for transportista_nombre in transportistas_autorizados:
         banda_transportista = calcular_banda_transportista(transportista_nombre, minera_nombre)
         matriz_data['bandas_transportistas'][transportista_nombre] = banda_transportista
-        
         matriz_data['datos'][transportista_nombre] = {}
-        for _, row in resumen_diario.iterrows():
-            fecha_str = row['Fecha'].strftime('%d-%m')
-            fecha_actual = row['Fecha'].date()
-            datos_trans = tabla_base[(tabla_base['Transportista'] == transportista_nombre) & (tabla_base['Fecha'] == row['Fecha'])]
-            viajes_realizados = int(datos_trans['Entregado totalmente'].sum())
+        
+        for fecha_completa in fechas_completas:
+            fecha_str = fecha_completa.strftime('%d-%m')
+            fecha_full = fecha_completa.strftime('%Y-%m-%d')
             
-            # Calcular disponibilidad por banda: (viajes realizados / banda transportista) * 100
+            # Obtener entregas del transportista en esa fecha
+            datos_trans = datos_agregados[
+                (datos_agregados['Transportista'] == transportista_nombre) & 
+                (datos_agregados['fecha_completa'] == fecha_completa)
+            ]
+            viajes_realizados = int(datos_trans['Entregado_totalmente'].sum())
+            
+            # Calcular disponibilidad por banda
             if banda_transportista and banda_transportista > 0:
                 disponibilidad_banda = (viajes_realizados / banda_transportista) * 100
-                disponibilidad_banda = min(100, disponibilidad_banda)
             else:
                 disponibilidad_banda = 0
             
-            # Calcular disponibilidad operacional para este transportista y fecha
-            # Usar la misma función que usa el detalle para consistencia
+            # Calcular disponibilidad operacional
             disp_op_data = {'porcentaje': 0, 'turnos_enviados': 0, 'entregas_exitosas': 0}
             entregas_licitadas = 0
             entregas_totales = 0
             
-            if datos_completos is not None and not datos_completos.empty:
-                # Convertir la columna Fecha a datetime para comparación correcta
-                # La columna 'Fecha' en datos_completos tiene formato '22-Nov' (string)
-                # Necesitamos comparar con fecha_actual que es date
-                fecha_str_buscar = fecha_actual.strftime('%d-%b')  # Ejemplo: '22-Nov'
-                
-                # Filtrar datos completos por transportista y fecha
-                datos_dia = datos_completos[
-                    (datos_completos['Transportista'] == transportista_nombre) &
-                    (datos_completos['Fecha'] == fecha_str_buscar)
-                ]
-                
-                if not datos_dia.empty:
-                    # IMPORTANTE: Filtrar solo camiones que tienen actividad SCR ese día
-                    # Solo incluir camiones que tienen entregas, en ruta o planificado > 0
-                    # Excluir camiones que SOLO tienen turnos/RCO pero no actividad SCR
-                    datos_dia_con_actividad = datos_dia[
-                        (datos_dia['Entregado_totalmente'] > 0) |
-                        (datos_dia.get('En_ruta', 0) > 0) |
-                        (datos_dia.get('Planificado', 0) > 0)
-                    ].copy()
-                    
-                    
-                    if not datos_dia_con_actividad.empty:
-                        # Usar la función calcular_disponibilidad_operacional para consistencia con el detalle
-                        # Pasar banda_transportista como parámetro
-                        resultado_disp = calcular_disponibilidad_operacional(datos_dia_con_actividad, banda_transportista)
-                        
-                        disp_op_data = {
-                            'porcentaje': resultado_disp['disponibilidad_porcentaje'],
-                            'turnos_enviados': resultado_disp['turnos_enviados_total'],
-                            'entregas_exitosas': resultado_disp['entregas_exitosas_total'],
-                            'entregas_criterio_a': resultado_disp['entregas_criterio_a'],
-                            'entregas_criterio_b': resultado_disp['entregas_criterio_b']
-                        }
-                        
-                        # Obtener datos de disponibilidad licitada desde la misma función
-                        entregas_licitadas = resultado_disp['entregas_licitadas']
-                        entregas_totales = resultado_disp['entregas_totales']
-
+            # Filtrar datos completos por transportista y fecha para cálculo detallado
+            datos_dia = datos_completos[
+                (datos_completos['Transportista'] == transportista_nombre) &
+                (datos_completos['fecha_completa'] == fecha_completa)
+            ]
+            
+            if not datos_dia.empty:
+                # NO filtrar - usar TODOS los datos del día para calcular disponibilidad operacional
+                # La función calcular_disponibilidad_operacional ya maneja la lógica correctamente
+                resultado_disp = calcular_disponibilidad_operacional(datos_dia, banda_transportista)
+                disp_op_data = {
+                    'porcentaje': resultado_disp['disponibilidad_porcentaje'],
+                    'turnos_enviados': resultado_disp['turnos_enviados_total'],
+                    'entregas_exitosas': resultado_disp['entregas_exitosas_total']
+                }
+                entregas_licitadas = resultado_disp['entregas_licitadas']
+                entregas_totales = resultado_disp['entregas_totales']
+            
             matriz_data['datos'][transportista_nombre][fecha_str] = {
-                'porcentaje': round(disponibilidad_banda, 1),
+                'porcentaje': round(disp_op_data['porcentaje'], 1),  # Mostrar disponibilidad operacional como principal
+                'disponibilidad_banda': round(disponibilidad_banda, 1),  # Agregar disponibilidad por banda separada
                 'total': viajes_realizados,
                 'banda': banda_transportista,
                 'cumplidos': viajes_realizados,
                 'transportista_id': 0,
-                'fecha_full': row['Fecha'].strftime('%Y-%m-%d') if hasattr(row['Fecha'], 'strftime') else fecha_actual.strftime('%Y-%m-%d'),
+                'fecha_full': fecha_full,
                 'disponibilidad_operacional': disp_op_data,
                 'entregas_licitadas': entregas_licitadas,
                 'entregas_totales': entregas_totales
             }
     
-    # Procesar "OTRO TRANSPORTISTA" (medido por entregas, no por banda)
-    if not otros_transportistas_data.empty:
-        matriz_data['bandas_transportistas']['OTRO TRANSPORTISTA'] = None  # Sin banda
+    # Procesar "OTRO TRANSPORTISTA"
+    if otros_transportistas_data:
+        matriz_data['bandas_transportistas']['OTRO TRANSPORTISTA'] = None
         matriz_data['datos']['OTRO TRANSPORTISTA'] = {}
         
-        for _, row in resumen_diario.iterrows():
-            fecha_str = row['Fecha'].strftime('%d-%m') if hasattr(row['Fecha'], 'strftime') else row['Fecha']
-            fecha_actual = row['Fecha'].date() if hasattr(row['Fecha'], 'date') else row['Fecha']
-            datos_otros = otros_transportistas_data[otros_transportistas_data['Fecha'] == row['Fecha']]
-            entregas_realizadas = int(datos_otros['Entregado totalmente'].sum())
+        # Combinar todos los datos de otros transportistas
+        otros_combined = pd.concat(otros_transportistas_data, ignore_index=True)
+        
+        for fecha_completa in fechas_completas:
+            fecha_str = fecha_completa.strftime('%d-%m')
+            fecha_full = fecha_completa.strftime('%Y-%m-%d')
             
-            # Para "otros" no usamos porcentaje de banda, solo mostramos entregas
+            datos_otros = otros_combined[otros_combined['fecha_completa'] == fecha_completa]
+            entregas_realizadas = int(datos_otros['Entregado_totalmente'].sum())
+            
+            # Calcular disponibilidad operacional para OTROS
+            disp_op_otros = {'porcentaje': 0, 'turnos_enviados': 0, 'entregas_exitosas': 0}
+            
+            # Filtrar datos completos de otros transportistas para esta fecha
+            datos_dia_otros = datos_completos[
+                (~datos_completos['Transportista'].isin(transportistas_autorizados)) &
+                (datos_completos['fecha_completa'] == fecha_completa)
+            ]
+            
+            if not datos_dia_otros.empty:
+                # NO filtrar - usar TODOS los datos para el cálculo
+                resultado_disp = calcular_disponibilidad_operacional(datos_dia_otros, None)
+                disp_op_otros = {
+                    'porcentaje': resultado_disp['disponibilidad_porcentaje'],
+                    'turnos_enviados': resultado_disp['turnos_enviados_total'],
+                    'entregas_exitosas': resultado_disp['entregas_exitosas_total']
+                }
+            
             matriz_data['datos']['OTRO TRANSPORTISTA'][fecha_str] = {
-                'porcentaje': 0,  # No aplica concepto de banda
+                'porcentaje': round(disp_op_otros['porcentaje'], 1),  # Usar disponibilidad operacional
                 'total': entregas_realizadas,
-                'banda': None,  # Sin banda asignada
+                'banda': None,
                 'cumplidos': entregas_realizadas,
                 'transportista_id': 0,
-                'fecha_full': row['Fecha'].strftime('%Y-%m-%d') if hasattr(row['Fecha'], 'strftime') else str(row['Fecha']),
-                'es_otro': True,  # Marca especial para el frontend
-                'disponibilidad_operacional': {'porcentaje': 0, 'turnos_enviados': 0, 'entregas_exitosas': 0},
+                'fecha_full': fecha_full,
+                'es_otro': True,
+                'disponibilidad_operacional': disp_op_otros,
                 'entregas_licitadas': 0,
-                'entregas_totales': 0
+                'entregas_totales': entregas_realizadas
             }
-
+    
+    print(f"✅ [MATRIZ] Datos procesados: {len(transportistas_finales)} transportistas x {len(fechas)} fechas")
+    
     return matriz_data
 
-
-@cache.cached(timeout=1800, key_prefix='transportistas_global')  # Cache por 30 minutos
-def obtener_transportistas_global():
-    """Obtener transportistas únicos de la tabla completa (para administración)."""
-    if not USE_ATHENA:
-        return []
-    # OPTIMIZACIÓN: Agregar límite y filtro de SIN_INFORMACION en query
-    query = f"""
-    SELECT DISTINCT carriername1 as transportista 
-    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS} 
-    WHERE carriername1 IS NOT NULL 
-      AND carriername1 != 'SIN_INFORMACION'
-    ORDER BY transportista
-    """
-    try:
-        df = sql_athena(query)
-        if df.empty:
-            return []
-        # Filtrar 'SIN_INFORMACION' de la lista
-        transportistas = sorted(df['transportista'].dropna().unique().tolist())
-        return [t for t in transportistas if t != 'SIN_INFORMACION']
-    except Exception as e:
-        print(f"Error obteniendo transportistas desde Athena: {e}")
-        return []
-
-
-# Rutas principales
-@app.route('/')
-@auth.login_required
-def index():
-    """Vista principal - Dashboard (lista de mineras predefinidas)"""
-    mineras = obtener_mineras_athena()
-    data_source = 'Lista predefinida de mineras'
-    return render_template('index.html', mineras=mineras, data_source=data_source)
-
-
-@app.route('/exportar')
-@auth.login_required
-def exportar():
-    """Vista para exportar datos a Excel"""
-    mineras = obtener_mineras_athena()
-    return render_template('exportar.html', mineras=mineras)
-
-
-@app.route('/detalle')
-@auth.login_required
-def detalle():
-    """Vista de detalle de transportista (Athena)
-
-    Query params expected:
-    - minera: nombre de la minera (string)
-    - transportista: nombre del transportista (string)
-    - fecha: YYYY-MM-DD
-    """
-    minera_nombre = request.args.get('minera')
-    transportista_nombre = request.args.get('transportista')
-    fecha = request.args.get('fecha')
-
-    registros = []
-    banda_info = {}
-    datos_completos = None
-    datos_completos_camiones = []  # Nueva variable para tabla de detalle por camión
-    datos_completos_originales = None  # Guardar datos completos sin filtrar
-    
-    if USE_ATHENA and minera_nombre and fecha and transportista_nombre:
-        fecha_obj = datetime.strptime(fecha, '%Y-%m-%d').date()
-        
-        # Obtener datos completos (SCR + Turnos + RCO)
-        datos_completos_originales = obtener_datos_completos_athena(minera_nombre, fecha_obj, fecha_obj)
-        datos_completos = datos_completos_originales  # Copiar referencia
-        
-        if datos_completos is not None and not datos_completos.empty:
-            # Manejar el caso especial de "OTRO TRANSPORTISTA"
-            if transportista_nombre == 'OTRO TRANSPORTISTA':
-                # Filtrar solo transportistas no autorizados
-                transportistas_no_autorizados = []
-                for transportista in datos_completos['Transportista'].unique():
-                    if not es_transportista_autorizado(transportista, minera_nombre):
-                        transportistas_no_autorizados.append(transportista)
-                                
-                datos_completos_filtrados = datos_completos[
-                    datos_completos['Transportista'].isin(transportistas_no_autorizados)
-                ]
-                
-                # Para los registros SCR, también incluir todos los transportistas no autorizados
-                df_scr = obtener_datos_desde_athena(minera_nombre, fecha_obj, fecha_obj)
-                if df_scr is not None and not df_scr.empty:
-                    df_scr_filtrado = df_scr[
-                        df_scr['Transportista'].isin(transportistas_no_autorizados)
-                    ]
-                    registros = df_scr_filtrado.to_dict('records')
-            else:
-                # Caso normal: filtrar por transportista específico   
-                datos_completos_filtrados = datos_completos[datos_completos['Transportista'] == transportista_nombre]
-                
-                # Para mantener compatibilidad con el template existente, 
-                # también obtenemos los datos SCR básicos para los registros individuales
-                df_scr = obtener_datos_desde_athena(minera_nombre, fecha_obj, fecha_obj)
-                if df_scr is not None and not df_scr.empty:
-                    df_scr = df_scr[df_scr['Transportista'] == transportista_nombre]
-                    registros = df_scr.to_dict('records')
-            
-            # Calcular bandas por transportista usando todos los transportistas con datos completos
-            # NOTA: Esta sección será sobrescrita por la nueva lógica más abajo si hay flota licitada
-            if not datos_completos_filtrados.empty and transportista_nombre == 'OTRO TRANSPORTISTA':
-                # Solo para OTRO TRANSPORTISTA (fallback)
-                transportistas_unicos = datos_completos_filtrados['Transportista'].unique()
-                bandas_por_transportista = {}
-                
-                for transp in transportistas_unicos:
-                    bandas_por_transportista[transp] = None  # Sin banda
-                
-                # Calcular disponibilidad operacional según nueva métrica
-                disponibilidad_operacional = calcular_disponibilidad_operacional(datos_completos_filtrados, None)
-                
-                banda_info = {
-                    'banda_total': None,
-                    'bandas_por_transportista': bandas_por_transportista,
-                    'transportistas_unicos': list(transportistas_unicos),
-                    'es_otro_transportista': True,
-                    'disponibilidad_operacional': disponibilidad_operacional
-                }
-                
-                # Usar los datos filtrados para el template
-                datos_completos = datos_completos_filtrados
-        
-        # NUEVA LÓGICA: Usar las mismas queries que obtener_actividad_flota_licitada
-        # pero filtrada solo por el transportista seleccionado
-        if transportista_nombre != 'OTRO TRANSPORTISTA':
-            # Obtener flota licitada completa para la minera
-            df_flota = obtener_flota_licitada_athena(minera_nombre)
-            
-            if not df_flota.empty:
-                # Extraer palabras clave del nombre del transportista
-                palabras_transportista = [
-                    palabra for palabra in transportista_nombre.upper().replace('.', '').replace(',', '').split()
-                    if len(palabra) > 3
-                ]
-                
-                print(f"\n{'='*80}")
-                print(f"🚛 BUSCANDO FLOTA DEL TRANSPORTISTA")
-                print(f"   Transportista buscado: {transportista_nombre}")
-                print(f"   Palabras clave: {palabras_transportista}")
-                
-                # Filtrar vehículos del transportista
-                def match_transportista(nombre_flota):
-                    if pd.isna(nombre_flota):
-                        return False
-                    nombre_normalizado = nombre_flota.upper().replace('.', '').replace(',', '')
-                    return all(palabra in nombre_normalizado for palabra in palabras_transportista)
-                
-                df_flota_transportista = df_flota[
-                    df_flota['nombre_transportista'].apply(match_transportista)
-                ].copy()
-                
-                print(f"   ✓ Total vehículos encontrados en flota: {len(df_flota_transportista)}")
-                
-                if not df_flota_transportista.empty:
-                    vehiculos_transportista = df_flota_transportista['codigo_tanque'].tolist()
-                    
-                    # 1. Obtener turnos enviados (MISMA QUERY que obtener_actividad_flota_licitada)
-                    query_turnos = f"""
-                    SELECT id_vehiculo, COUNT(DISTINCT id_turno_uuid) as turnos_enviados
-                    FROM (
-                        SELECT id_turno_uuid, id_vehiculo, estado,
-                               ROW_NUMBER() OVER (PARTITION BY id_turno_uuid ORDER BY fecha_hora DESC) as rn
-                        FROM {DATABASE_DISPOMATE}.{TABLA_TURNOS}
-                        WHERE DATE(fecha_inicio_utc) >= DATE('{fecha}')
-                          AND DATE(fecha_inicio_utc) <= DATE('{fecha}')
-                          AND id_vehiculo IN ({','.join(map(str, vehiculos_transportista))})
-                    )
-                    WHERE rn = 1 AND estado = 'ENVIADO'
-                    GROUP BY id_vehiculo
-                    """
-                    
-                    try:
-                        df_turnos = sql_athena(query_turnos)
-                    except Exception as e:
-                        print(f"   ⚠️ Error obteniendo turnos: {e}")
-                        df_turnos = pd.DataFrame()
-                    
-                    # 2. Obtener conexiones RCO (MISMA QUERY que obtener_actividad_flota_licitada)
-                    query_rco = f"""
-                    SELECT codigo_tanque, COUNT(*) as conexiones_rco
-                    FROM {DATABASE_DISPOMATE}.{TABLA_RCO}
-                    WHERE DATE(fecha_conexion_utc) >= DATE('{fecha}')
-                      AND DATE(fecha_conexion_utc) <= DATE('{fecha}')
-                      AND codigo_tanque IN ({','.join(map(str, vehiculos_transportista))})
-                    GROUP BY codigo_tanque
-                    """
-                    
-                    try:
-                        df_rco = sql_athena(query_rco)
-                    except Exception as e:
-                        print(f"   ⚠️ Error obteniendo conexiones RCO: {e}")
-                        df_rco = pd.DataFrame()
-                    
-                    # 3. Obtener entregas (MISMA QUERY que obtener_actividad_flota_licitada)
-                    query_entregas = f"""
-                    SELECT 
-                        CAST(vehiclereal AS INTEGER) as vehiclereal,
-                        descrstatu as estado,
-                        COUNT(*) as cantidad
-                    FROM {DATABASE_ATHENA}.{TABLA_PEDIDOS}
-                    WHERE vdatu >= '{fecha}'
-                      AND vdatu <= '{fecha}'
-                      AND CAST(vehiclereal AS INTEGER) IN ({','.join(map(str, vehiculos_transportista))})
-                    GROUP BY CAST(vehiclereal AS INTEGER), descrstatu
-                    """
-                    
-                    try:
-                        df_entregas = sql_athena(query_entregas)
-                        if not df_entregas.empty:
-                            df_entregas['vehiclereal'] = df_entregas['vehiclereal'].astype(int)
-                    except Exception as e:
-                        print(f"   ⚠️ Error obteniendo entregas: {e}")
-                        df_entregas = pd.DataFrame()
-                    
-                    # 4. Combinar información para cada vehículo
-                    for _, vehiculo in df_flota_transportista.iterrows():
-                        codigo_tanque = int(vehiculo['codigo_tanque'])
-                        
-                        # Turnos enviados
-                        turnos_enviados = 0
-                        if not df_turnos.empty and 'id_vehiculo' in df_turnos.columns:
-                            turno_row = df_turnos[df_turnos['id_vehiculo'] == codigo_tanque]
-                            if not turno_row.empty:
-                                turnos_enviados = int(turno_row['turnos_enviados'].iloc[0])
-                        
-                        # Conexiones RCO
-                        conexion_rco = 0
-                        if not df_rco.empty and 'codigo_tanque' in df_rco.columns:
-                            rco_row = df_rco[df_rco['codigo_tanque'] == codigo_tanque]
-                            if not rco_row.empty:
-                                conexion_rco = int(rco_row['conexiones_rco'].iloc[0])
-                        
-                        # Entregas
-                        entregado_totalmente = 0
-                        en_ruta = 0
-                        planificado = 0
-                        
-                        if not df_entregas.empty:
-                            entregas_vehiculo = df_entregas[df_entregas['vehiclereal'] == codigo_tanque]
-                            
-                            if not entregas_vehiculo.empty:
-                                # Entregado totalmente
-                                entregas_completadas = entregas_vehiculo[
-                                    entregas_vehiculo['estado'].isin(['Entregado totalmente', 'Recibí Conforme'])
-                                ]
-                                entregado_totalmente = int(entregas_completadas['cantidad'].sum()) if not entregas_completadas.empty else 0
-                                
-                                # En Ruta
-                                en_ruta_rows = entregas_vehiculo[entregas_vehiculo['estado'] == 'En Ruta']
-                                en_ruta = int(en_ruta_rows['cantidad'].sum()) if not en_ruta_rows.empty else 0
-                                
-                                # Planificado
-                                planificado_rows = entregas_vehiculo[entregas_vehiculo['estado'] == 'Planificado']
-                                planificado = int(planificado_rows['cantidad'].sum()) if not planificado_rows.empty else 0
-                        
-                        # LÓGICA DE DISPONIBILIDAD (2 criterios activos):
-                        disponible = 0
-                        if entregado_totalmente > 0:
-                            disponible = 1
-                        elif conexion_rco > 0:
-                            disponible = 1
-                        
-                        datos_completos_camiones.append({
-                            'Camion': codigo_tanque,
-                            'Fecha': fecha,
-                            'Es_licitado': 'Si',
-                            'Transportista': vehiculo['nombre_transportista'],
-                            'Turnos_enviados': turnos_enviados,
-                            'Conexion_RCO': conexion_rco,
-                            'Entregado_totalmente': entregado_totalmente,
-                            'En_ruta': en_ruta,
-                            'Planificado': planificado,
-                            'Disponible': disponible
-                        })
-                    
-                    print(f"   ✅ Procesados {len(datos_completos_camiones)} vehículos")
-                    print(f"{'='*80}\n")
-                    
-                    # Calcular KPI de Disponibilidad Operacional con los datos correctos
-                    if datos_completos_camiones:
-                        # Sumar total de camiones disponibles
-                        camiones_disponibles = sum(camion['Disponible'] for camion in datos_completos_camiones)
-                        
-                        # Obtener banda del transportista
-                        banda_transportista = calcular_banda_transportista(transportista_nombre, minera_nombre)
-                        
-                        # Calcular porcentaje
-                        if banda_transportista and banda_transportista > 0:
-                            disponibilidad_porcentaje = (camiones_disponibles / banda_transportista) * 100
-                            disponibilidad_porcentaje = min(100.0, disponibilidad_porcentaje)
-                        else:
-                            disponibilidad_porcentaje = 0.0
-                        
-                        # Calcular disponibilidad licitada (todos los camiones en datos_completos_camiones son licitados)
-                        entregas_totales = sum(camion['Entregado_totalmente'] for camion in datos_completos_camiones)
-                        entregas_licitadas = entregas_totales  # Todos son licitados
-                        
-                        disponibilidad_licitada_porcentaje = 100.0 if entregas_totales > 0 else 0.0
-                        
-                        # Crear estructura de disponibilidad operacional
-                        disponibilidad_operacional = {
-                            'disponibilidad_porcentaje': round(disponibilidad_porcentaje, 1),
-                            'camiones_disponibles': camiones_disponibles,
-                            'banda_total': banda_transportista,
-                            'entregas_exitosas_total': camiones_disponibles,  # Para compatibilidad
-                            'entregas_criterio_a': sum(1 for c in datos_completos_camiones if c['Entregado_totalmente'] > 0),
-                            'entregas_criterio_b': sum(1 for c in datos_completos_camiones if c['Entregado_totalmente'] == 0 and c['Conexion_RCO'] > 0),
-                            'turnos_enviados_total': sum(camion['Turnos_enviados'] for camion in datos_completos_camiones),
-                            'entregas_licitadas': entregas_licitadas,
-                            'entregas_totales': entregas_totales,
-                            'disponibilidad_licitada_porcentaje': round(disponibilidad_licitada_porcentaje, 1)
-                        }
-                        
-                        banda_info = {
-                            'banda_total': banda_transportista,
-                            'bandas_por_transportista': {transportista_nombre: banda_transportista},
-                            'transportistas_unicos': [transportista_nombre],
-                            'es_otro_transportista': False,
-                            'disponibilidad_operacional': disponibilidad_operacional
-                        }
-                        
-
-    # Obtener información de flota licitada con actividad detallada para la minera
-    flota_licitada = []
-    if USE_ATHENA and minera_nombre and fecha:
-        fecha_obj = datetime.strptime(fecha, '%Y-%m-%d').date()
-        flota_licitada = obtener_actividad_flota_licitada(minera_nombre, fecha_obj, fecha_obj)
-    elif USE_ATHENA and minera_nombre:
-        # Si no hay fecha, solo mostrar la flota sin actividad
-        df_flota = obtener_flota_licitada_athena(minera_nombre)
-        if not df_flota.empty:
-            flota_licitada = df_flota.to_dict('records')
-    
-    mineras = obtener_mineras_athena()
-    transportistas = obtener_transportistas_global() if USE_ATHENA else []
-
-    return render_template('detalle.html', 
-                         minera=minera_nombre, 
-                         transportista=transportista_nombre,
-                         fecha=fecha,
-                         registros=registros,
-                         datos_completos=datos_completos_camiones if datos_completos_camiones else [],
-                         banda_info=banda_info,
-                         flota_licitada=flota_licitada,
-                         mineras=mineras,
-                         transportistas=transportistas)
-
-
-# ============================================
-# FUNCIÓN DE EXPORTACIÓN MATRICIAL XLSX
-# ============================================
 def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, minera_nombre):
     """
     Generar archivo XLSX con formato matricial por transportista LICITADO
@@ -1865,6 +2153,14 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
         # Filtrar SOLO datos de flota licitada del transportista
         df_transp = df_licitados[df_licitados['Transportista'] == transportista].copy()
         
+        # DEBUG: Ver datos antes de procesar
+        print(f"\n📊 DEBUG EXCEL - Transportista: {transportista}")
+        print(f"Total registros: {len(df_transp)}")
+        if not df_transp.empty:
+            print("Columnas:", df_transp.columns.tolist())
+            print("Primeros registros:")
+            print(df_transp[['Camion', 'Fecha', 'Turno', 'Entregado_totalmente', 'Conexion_RCO']].head(10))
+        
         # Crear worksheet
         ws = workbook.create_sheet(title=transportista[:31])  # Límite de 31 caracteres
         
@@ -1906,9 +2202,16 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
         
         ws['A5'] = 'Día'
         ws['A6'] = 'Camion \\ Criterio'
+        ws['B5'] = ''  # Dejar vacío para columna Turno
+        ws['B6'] = 'Turno'
+        
+        # Aplicar formato a columna Turno
+        ws.cell(row=row_criterio, column=2).font = header_font
+        ws.cell(row=row_criterio, column=2).fill = header_fill
+        ws.cell(row=row_criterio, column=2).alignment = center_alignment
         
         # Configurar encabezados de días y criterios
-        current_col = 2  # Columna B
+        current_col = 3  # Columna C (después de Camion y Turno)
         for fecha in fechas:
             dia_numero = fecha.day
             
@@ -1942,15 +2245,32 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
             # Nombre del camión en columna A
             ws.cell(row=row_actual, column=1).value = int(camion)
             
-            # Filtrar datos del camión
+            # Obtener turno del camión (usar el primer registro para obtener el turno)
+            df_camion_turno = df_transp[df_transp['Camion'] == camion].copy()
+            turnos_camion = df_camion_turno['Turno'].unique()
+            turno_display = ', '.join([str(t) for t in turnos_camion if t and t != 'N/A'])
+            if not turno_display:
+                turno_display = 'Sin turnos'
+            ws.cell(row=row_actual, column=2).value = turno_display
+            ws.cell(row=row_actual, column=2).alignment = center_alignment
+            
+            # Filtrar datos del camión y agrupar por fecha (sumar turnos del mismo día)
             df_camion = df_transp[df_transp['Camion'] == camion].copy()
+            df_camion['fecha_key'] = pd.to_datetime(df_camion['fecha_completa']).dt.date
+            
+            # Agrupar por fecha sumando todos los valores (combina múltiples turnos)
+            df_camion_agrupado = df_camion.groupby('fecha_key').agg({
+                'Entregado_totalmente': 'sum',
+                'Conexion_RCO': 'sum',
+                'En_ruta': 'sum',
+                'Planificado': 'sum'
+            }).reset_index()
             
             # Crear diccionario fecha -> datos para acceso rápido
-            df_camion['fecha_key'] = pd.to_datetime(df_camion['fecha_completa']).dt.date
-            datos_por_fecha = df_camion.set_index('fecha_key').to_dict('index')
+            datos_por_fecha = df_camion_agrupado.set_index('fecha_key').to_dict('index')
             
             # Llenar datos por fecha
-            current_col = 2
+            current_col = 3  # Empieza en columna C (después de Camion y Turno)
             for fecha in fechas:
                 fecha_key = fecha.date()
                 
@@ -1992,8 +2312,11 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
         cell_totales.font = Font(bold=True)
         cell_totales.alignment = center_alignment
         
+        # Dejar vacía la columna del turno
+        ws.cell(row=row_totales, column=2).value = ""
+        
         # Calcular totales por día y criterio
-        current_col = 2
+        current_col = 3  # Empieza en columna C
         for fecha in fechas:
             # Para cada día, sumar todos los camiones
             for offset_criterio in range(3):  # 3 criterios
@@ -2020,8 +2343,12 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
         cell_total_general.alignment = center_alignment
         cell_total_general.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
         
+        # Dejar vacía la columna del turno
+        ws.cell(row=row_total_general, column=2).value = ""
+        ws.cell(row=row_total_general, column=2).fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
+        
         # Calcular total general por día (suma de los 3 criterios)
-        current_col = 2
+        current_col = 3  # Empieza en columna C
         for fecha in fechas:
             # Sumar los 3 criterios del día
             col1_letter = openpyxl.utils.get_column_letter(current_col)
@@ -2045,7 +2372,8 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
         # APLICAR BORDES Y AJUSTAR COLUMNAS
         # Ajustar ancho de columnas
         ws.column_dimensions['A'].width = 20
-        for col in range(2, current_col):
+        ws.column_dimensions['B'].width = 12  # Columna Turno
+        for col in range(3, current_col):  # Desde columna C en adelante
             col_letter = openpyxl.utils.get_column_letter(col)
             ws.column_dimensions[col_letter].width = 4
         
@@ -2057,10 +2385,10 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
     
     # HOJAS ADICIONALES: LOGS (SOLO FLOTA LICITADA)
     
-    # HOJA: LOG - Entregas Licitadas
+    # HOJA: LOG - Entregas Licitadas (CON TURNO)
     ws_entregas = workbook.create_sheet(title='LOG - Entregas Licitadas')
     entregas_data = df_licitados[df_licitados['Entregado_totalmente'] > 0][
-        ['Fecha', 'Camion', 'Transportista', 'Entregado_totalmente']
+        ['Fecha', 'Camion', 'Turno', 'Transportista', 'Entregado_totalmente']
     ].copy()
     
     for r_idx, row in enumerate(dataframe_to_rows(entregas_data, index=False, header=True), 1):
@@ -2071,10 +2399,10 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
                 cell.fill = header_fill
                 cell.alignment = center_alignment
     
-    # HOJA: LOG - RCO Licitadas
+    # HOJA: LOG - RCO Licitadas (CON TURNO)
     ws_rco = workbook.create_sheet(title='LOG - RCO Licitadas')
     rco_data = df_licitados[df_licitados['Conexion_RCO'] > 0][
-        ['Fecha', 'Camion', 'Transportista', 'Conexion_RCO']
+        ['Fecha', 'Camion', 'Turno', 'Transportista', 'Conexion_RCO']
     ].copy()
     
     for r_idx, row in enumerate(dataframe_to_rows(rco_data, index=False, header=True), 1):
@@ -2085,10 +2413,10 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
                 cell.fill = header_fill
                 cell.alignment = center_alignment
     
-    # HOJA: LOG - Eventos Licitadas
+    # HOJA: LOG - Eventos Licitadas (CON TURNO)
     ws_eventos = workbook.create_sheet(title='LOG - Eventos Licitadas')
     eventos_data = df_licitados[
-        ['Fecha', 'Camion', 'Transportista', 
+        ['Fecha', 'Camion', 'Turno', 'Transportista', 
          'Turnos_enviados', 'Conexion_RCO', 'Entregado_totalmente', 'En_ruta', 'Planificado']
     ].copy()
     
@@ -2125,6 +2453,211 @@ def exportar_xlsx_matricial(df_export, fecha_inicio, fecha_fin, output_buffer, m
     # Guardar workbook
     workbook.save(output_buffer)
 
+
+# ============================================
+# RUTA PRINCIPAL: DETALLE (REFACTORIZADA)
+# ============================================
+@app.route('/detalle')
+@auth.login_required
+def detalle():
+    """
+    Vista de detalle con análisis granular por turno.
+    """
+    minera_nombre = request.args.get('minera')
+    transportista_nombre = request.args.get('transportista')
+    fecha = request.args.get('fecha')
+    
+    datos_completos_camiones = []
+    banda_info = {
+        'banda_total': 0,
+        'bandas_por_transportista': {},
+        'transportistas_unicos': [],
+        'es_otro_transportista': False,
+        'disponibilidad_operacional': {}
+    }
+    
+    if USE_ATHENA and minera_nombre and transportista_nombre and fecha:
+        fecha_obj = datetime.strptime(fecha, '%Y-%m-%d').date()
+        
+        # OPTIMIZACIÓN: Cargar datos completos UNA SOLA VEZ usando caché
+        datos_completos = obtener_datos_completos_athena(minera_nombre, fecha_obj, fecha_obj)
+        
+        if datos_completos is not None and not datos_completos.empty:            
+            # Normalizar nombre del transportista para matching
+            palabras_transportista = [
+                palabra.upper().replace('.', '').replace(',', '')
+                for palabra in transportista_nombre.split()
+                if len(palabra) > 2
+            ]
+            
+            def match_transportista(nombre_flota):
+                if pd.isna(nombre_flota):
+                    return False
+                nombre_normalizado = nombre_flota.upper().replace('.', '').replace(',', '')
+                return all(palabra in nombre_normalizado for palabra in palabras_transportista)
+            
+            print(f"🔍 DEBUG - Transportistas únicos en datos_completos:")
+            print(datos_completos['Transportista'].unique())
+            print(f"🔍 DEBUG - Buscando: {transportista_nombre}")
+            print(f"🔍 DEBUG - Palabras clave: {palabras_transportista}")
+            
+            # Primero, identificar qué camiones pertenecen al transportista
+            # (al menos un turno con actividad del transportista)
+            camiones_del_transportista = datos_completos[
+                datos_completos['Transportista'].apply(match_transportista)
+            ]['Camion'].unique()
+            
+            print(f"🚛 Camiones identificados para {transportista_nombre}: {len(camiones_del_transportista)}")
+            print(f"🚛 Camiones: {sorted(camiones_del_transportista)}")
+            
+            # Filtrar TODOS los turnos de esos camiones para esa fecha
+            # Esto incluye turnos sin actividad
+            df_transportista = datos_completos[
+                datos_completos['Camion'].isin(camiones_del_transportista)
+            ].copy()
+            
+            # Asegurar que el transportista esté correctamente asignado
+            # (algunos turnos pueden tener SIN_INFORMACION si no tuvieron actividad)
+            df_transportista['Transportista'] = df_transportista.apply(
+                lambda row: transportista_nombre if match_transportista(row['Transportista']) 
+                else (transportista_nombre if row['Transportista'] == 'SIN_INFORMACION' else row['Transportista']),
+                axis=1
+            )
+            
+            print(f"📊 Datos filtrados para {transportista_nombre}: {len(df_transportista)} registros (todos los turnos)")
+            print(f"📊 Breakdown:")
+            print(f"   - Con Entregado_totalmente > 0: {(df_transportista['Entregado_totalmente'] > 0).sum()}")
+            print(f"   - Con Turnos_enviados > 0: {(df_transportista['Turnos_enviados'] > 0).sum()}")
+            print(f"   - Con Conexion_RCO > 0: {(df_transportista['Conexion_RCO'] > 0).sum()}")
+            
+            if not df_transportista.empty:
+                # Agregar columna 'Disponible' si no existe
+                if 'Disponible' not in df_transportista.columns:
+                    df_transportista['Disponible'] = (
+                        (df_transportista['Entregado_totalmente'] > 0) | 
+                        (df_transportista['Conexion_RCO'] > 0)
+                    ).astype(int)
+                
+                # Renombrar columna para compatibilidad con template
+                if '¿Es licitado?' in df_transportista.columns:
+                    df_transportista['Es_licitado'] = df_transportista['¿Es licitado?']
+                
+                # Convertir a lista de diccionarios para template
+                datos_completos_camiones = df_transportista.to_dict('records')
+                
+                # Calcular disponibilidad operacional
+                banda_transportista = calcular_banda_transportista(transportista_nombre, minera_nombre)
+                disponibilidad_operacional = calcular_disponibilidad_operacional(
+                    df_transportista, 
+                    banda_total=banda_transportista
+                )
+                
+                banda_info = {
+                    'banda_total': banda_transportista,
+                    'bandas_por_transportista': {transportista_nombre: banda_transportista},
+                    'transportistas_unicos': [transportista_nombre],
+                    'es_otro_transportista': False,
+                    'disponibilidad_operacional': disponibilidad_operacional
+                }
+    
+    # Obtener información de flota licitada (TODOS los vehículos del mantenedor)
+    flota_licitada = []
+    if USE_ATHENA and minera_nombre and fecha:
+        fecha_obj = datetime.strptime(fecha, '%Y-%m-%d').date()
+        
+        # 1. Obtener TODOS los vehículos licitados del mantenedor
+        df_mantenedor_flota = obtener_flota_licitada_athena(minera_nombre)
+        
+        if not df_mantenedor_flota.empty:
+            # 2. Obtener datos de actividad (cacheados)
+            datos_completos = obtener_datos_completos_athena(minera_nombre, fecha_obj, fecha_obj)
+            
+            # 3. Crear diccionario de actividad por camión (sumar todos los turnos del día)
+            actividad_por_camion = {}
+            if datos_completos is not None and not datos_completos.empty:
+                # Agrupar por camión (sumar todos los turnos del día)
+                actividad_agregada = datos_completos.groupby('Camion').agg({
+                    'Turnos_enviados': 'sum',
+                    'Conexion_RCO': 'sum',
+                    'Entregado_totalmente': 'sum',
+                    'Transportista': 'first'  # Tomar el primer transportista
+                }).reset_index()
+                
+                for _, row in actividad_agregada.iterrows():
+                    codigo = int(row['Camion'])
+                    actividad_por_camion[codigo] = {
+                        'turnos_enviados': int(row['Turnos_enviados']),
+                        'conexiones_rco': int(row['Conexion_RCO']),
+                        'entregas_realizadas': int(row['Entregado_totalmente']),
+                        'transportista': row['Transportista']
+                    }
+            
+            # 4. Crear registros combinando mantenedor con actividad
+            registros_licitados = []
+            for _, vehiculo in df_mantenedor_flota.iterrows():
+                codigo_tanque = int(vehiculo['codigo_tanque'])
+                
+                # Obtener actividad (o defaults si no hay)
+                actividad = actividad_por_camion.get(codigo_tanque, {
+                    'turnos_enviados': 0,
+                    'conexiones_rco': 0,
+                    'entregas_realizadas': 0,
+                    'transportista': vehiculo.get('nombre_transportista', 'SIN_INFORMACION')
+                })
+                
+                registros_licitados.append({
+                    'codigo_tanque': codigo_tanque,
+                    'nombre_transportista': actividad['transportista'],
+                    'turnos_enviados': actividad['turnos_enviados'],
+                    'conexiones_rco': actividad['conexiones_rco'],
+                    'entregas_realizadas': actividad['entregas_realizadas'],
+                    'tiene_actividad': (actividad['entregas_realizadas'] > 0 or actividad['conexiones_rco'] > 0),
+                    'uso': vehiculo.get('uso', ''),
+                    'estado': 'Activo'  # Del mantenedor
+                })
+            
+            flota_licitada = registros_licitados
+            
+            print(f"✅ Flota licitada completa: {len(flota_licitada)} vehículos totales")
+            sin_actividad = len([v for v in flota_licitada if not v['tiene_actividad']])
+            print(f"   - Con actividad: {len(flota_licitada) - sin_actividad}")
+            print(f"   - Sin actividad: {sin_actividad}")
+    
+    mineras = obtener_mineras_athena()
+    transportistas = obtener_transportistas_global() if USE_ATHENA else []
+
+    return render_template('detalle.html', 
+                         mineras=mineras,
+                         minera=minera_nombre,
+                         transportistas=transportistas,
+                         transportista=transportista_nombre,
+                         fecha=fecha,
+                         datos_completos=datos_completos_camiones,
+                         registros=datos_completos_camiones,
+                         flota_licitada=flota_licitada,
+                         banda_info=banda_info)
+
+
+# ============================================
+# OTRAS RUTAS Y ENDPOINTS
+# ============================================
+
+# Rutas principales
+@app.route('/')
+@auth.login_required
+def index():
+    """Vista principal - Dashboard (lista de mineras predefinidas)"""
+    mineras = obtener_mineras_athena()
+    data_source = 'Lista predefinida de mineras'
+    return render_template('index.html', mineras=mineras, data_source=data_source)
+
+
+@app.route('/exportar')
+@auth.login_required
+def exportar():
+    """Vista para exportar datos a Excel"""
+    mineras = obtener_mineras_athena()
+    return render_template('exportar.html', mineras=mineras)
 
 @app.route('/api/dashboard_data')
 @auth.login_required
@@ -2164,27 +2697,24 @@ def dashboard_data():
     grafico_data = obtener_datos_grafico_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max)
     matriz_data = obtener_datos_matriz_athena(minera_nombre, fecha_inicio, fecha_fin, viajes_min, viajes_max)
 
-    # Agregar información de bandas por transportista al grafico_data
-    bandas_por_transportista = {}
-    for transportista in grafico_data.get('transportistas', []):
-        if transportista != 'OTRO TRANSPORTISTA':
-            banda = calcular_banda_transportista(transportista, minera_nombre)
-            bandas_por_transportista[transportista] = banda
-        else:
-            bandas_por_transportista[transportista] = None
-    
-    grafico_data['bandas_transportista'] = bandas_por_transportista
+    # Las bandas ya están incluidas en matriz_data['bandas_transportistas']
+    # No necesitamos calcularlas de nuevo
+    bandas_por_transportista = matriz_data.get('bandas_transportistas', {})
 
-    return jsonify({
+    # Limpiar NaN antes de serializar a JSON
+    response_data = {
         'grafico': grafico_data,
         'matriz': matriz_data,
+        'bandas_transportista': bandas_por_transportista,
         'minera': {
             'nombre': minera_nombre,
             'viajes_minimos': viajes_min,
             'viajes_maximos': viajes_max
         },
         'source': 'Athena'
-    })
+    }
+    
+    return jsonify(clean_nan_for_json(response_data))
 
 
 @app.route('/api/semanas/<int:mes>')
@@ -2393,15 +2923,7 @@ def api_mineras():
     elif request.method == 'POST':
         return jsonify({'error': 'Creación de mineras no soportada en modo Athena-only'}), 405
 
-
 if __name__ == '__main__':
-    # Configuración para producción en Render
     port = int(os.getenv('PORT', 5000))
-    debug = os.getenv('FLASK_ENV', 'development') == 'development'
-    
-    print(f"🚀 Iniciando aplicación en puerto {port}")
-    print(f"🔧 Debug mode: {debug}")
-    print(f"⚡ Athena disponible: {ATHENA_AVAILABLE}")
-    print(f"🔐 Autenticación HTTP Basic activada")
-    
+    debug = os.getenv('FLASK_ENV', 'development') == 'development' 
     app.run(host='0.0.0.0', port=port, debug=debug)

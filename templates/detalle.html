@@ -70,7 +70,7 @@
         {% endif %}
         
         <!-- Métrica: Disponibilidad Por Banda -->
-        {% set entregados = registros|selectattr('Entregado totalmente', 'equalto', 1)|list|length %}
+        {% set entregados = datos_completos|sum(attribute='Entregado_totalmente') %}
         
         {% if banda_info and banda_info.get('es_otro_transportista') %}
         <div style="background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
@@ -82,7 +82,7 @@
         
         {% elif banda_info and banda_info.banda_total and banda_info.banda_total > 0 %}
         {% set banda_total = banda_info.banda_total %}
-        {% set porcentaje = (entregados / banda_total * 100)|round|int %}
+        {% set porcentaje = (entregados / banda_total * 100)|round(1) if banda_total > 0 else 0 %}
         <div style="background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
             <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 600; color: #495057;">Cumplimiento Por Banda</h3>
             <p style="margin: 0; font-size: 64px; font-weight: bold; line-height: 1; color: {% if porcentaje >= 85 %}#28a745{% else %}#dc3545{% endif %};">
@@ -158,13 +158,13 @@
         
         {% elif banda_info and banda_info.banda_total and banda_info.banda_total > 0 %}
         {% set banda_total = banda_info.banda_total %}
-        {% set porcentaje = (entregados / banda_total * 100)|round|int %}
+        {% set porcentaje = (entregados / banda_total * 100)|round(1) if banda_total > 0 else 0 %}
         <div style="background: #f8f9fa; border-radius: 8px; padding: 20px; border-left: 4px solid {% if porcentaje >= 85 %}#28a745{% else %}#dc3545{% endif %};">
-            <div style="font-size: 18px; font-weight: 600; margin-bottom: 10px; color: #2c3e50;">📐 Fórmula:</div>
-            <div style="font-size: 16px; color: #495057; margin-bottom: 12px; font-family: 'Courier New', monospace; background: white; padding: 8px; border-radius: 4px;">
+            <div style="font-size: 14px; font-weight: 600; margin-bottom: 10px; color: #2c3e50;">📐 Fórmula:</div>
+            <div style="font-size: 13px; color: #495057; margin-bottom: 12px; font-family: 'Courier New', monospace; background: white; padding: 8px; border-radius: 4px;">
                 (Entregas / Banda Total) × 100
             </div>
-            <div style="font-size: 14px; color: #6c757d; line-height: 1.6;">
+            <div style="font-size: 12px; color: #6c757d; line-height: 1.6;">
                 <strong>Entregas:</strong> {{ entregados }}<br>
                 <strong>Banda Total:</strong> {{ banda_total }}
             </div>
@@ -212,6 +212,7 @@
             <tr>
                 <th>Camión</th>
                 <th>Fecha</th>
+                <th>Turno</th>
                 <th>¿Es Licitado?</th>
                 <th>Transportista</th>
                 <th>Turnos Enviados</th>
@@ -227,6 +228,13 @@
             <tr>
                 <td><strong style="color: #3498db;">{{ dato.get('Camion', 'N/A') }}</strong></td>
                 <td>{{ dato.get('Fecha', 'N/A') }}</td>
+                <td>
+                    {% if dato.get('Turno', 'N/A') == 'N/A' %}
+                    <span style="color: #95a5a6; font-style: italic;">Sin turnos</span>
+                    {% else %}
+                    {{ dato.get('Turno') }}
+                    {% endif %}
+                </td>
                 <td>
                     {% if dato.get('Es_licitado', 'No') == 'Si' %}
                     <span style="color: #28a745; font-weight: bold;">✓ Sí</span>
